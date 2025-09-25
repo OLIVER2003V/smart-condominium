@@ -1,10 +1,12 @@
 // src/pages/EstadoCuentaPage.jsx
 import { useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { getEstadoCuenta, downloadEstadoCuentaCSV } from "../api/estado_cuenta";
 
 const fmtBs = (n) => `Bs. ${Number(n || 0).toFixed(2)}`;
 
 export default function EstadoCuentaPage() {
+  const navigate = useNavigate();
   const [loading, setLoading] = useState(true);
   const [data, setData] = useState(null);
   const [unidadSel, setUnidadSel] = useState("");
@@ -30,8 +32,20 @@ export default function EstadoCuentaPage() {
   const cuotas = data?.cuotas || [];
   const pagos = data?.pagos || [];
 
+  // Atajo: ir a la primera cuota con saldo > 0
+  function handleGoPay() {
+    const c = cuotas.find(x => {
+      const saldo = (Number(x.total_a_pagar) || 0) - (Number(x.pagado) || 0);
+      return saldo > 0 && x.is_active !== false;
+    });
+    if (!c) {
+      alert("No hay cuotas con saldo pendiente para pagar.");
+      return;
+    }
+    navigate(`/pay/${c.id}`);
+  }
+
   function handlePrint() {
-    // Imprime solo el contenido del card principal (ref)
     const html = printRef.current?.innerHTML || "";
     const w = window.open("", "_blank");
     w.document.write(`
@@ -78,7 +92,9 @@ export default function EstadoCuentaPage() {
           </div>
 
           <div className="au-toolbar__spacer" />
-
+          <button className="au-button au-button--ghost" onClick={handleGoPay}>
+            Pagar en línea
+          </button>
           <button className="au-button" onClick={() => downloadEstadoCuentaCSV(unidadSel || undefined)}>
             Descargar CSV
           </button>
@@ -114,17 +130,24 @@ export default function EstadoCuentaPage() {
         <table className="au-table">
           <thead>
             <tr>
-              <th>Periodo</th><th>Concepto</th><th>Vencimiento</th>
-              <th>Total</th><th>Pagado</th><th>Saldo</th><th>Estado</th>
+              <th>Periodo</th>
+              <th>Concepto</th>
+              <th>Vencimiento</th>
+              <th>Total</th>
+              <th>Pagado</th>
+              <th>Saldo</th>
+              <th>Estado</th>
+              <th>Acciones</th> {/* 👈 nueva columna */}
             </tr>
           </thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={7}>Cargando…</td></tr>
+              <tr><td colSpan={8}>Cargando…</td></tr>
             ) : (cuotas.length === 0 ? (
-              <tr><td colSpan={7}>Sin cuotas</td></tr>
+              <tr><td colSpan={8}>Sin cuotas</td></tr>
             ) : cuotas.map(c => {
               const saldo = (Number(c.total_a_pagar)||0) - (Number(c.pagado)||0);
+              const puedePagar = saldo > 0 && c.is_active !== false;
               return (
                 <tr key={c.id}>
                   <td>{c.periodo}</td>
@@ -134,6 +157,18 @@ export default function EstadoCuentaPage() {
                   <td>{fmtBs(c.pagado)}</td>
                   <td>{fmtBs(saldo)}</td>
                   <td>{c.estado}</td>
+                  <td>
+                    {puedePagar ? (
+                      <button
+                        className="au-button au-button--ghost"
+                        onClick={() => navigate(`/pay/${c.id}`)}
+                      >
+                        Pagar
+                      </button>
+                    ) : (
+                      <span className="muted">—</span>
+                    )}
+                  </td>
                 </tr>
               );
             }))}
@@ -145,7 +180,12 @@ export default function EstadoCuentaPage() {
         <table className="au-table">
           <thead>
             <tr>
-              <th>Fecha</th><th>Monto</th><th>Medio</th><th>Referencia</th><th>Periodo</th><th>Concepto</th>
+              <th>Fecha</th>
+              <th>Monto</th>
+              <th>Medio</th>
+              <th>Referencia</th>
+              <th>Periodo</th>
+              <th>Concepto</th>
             </tr>
           </thead>
           <tbody>

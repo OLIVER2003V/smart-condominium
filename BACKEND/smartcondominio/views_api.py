@@ -1,35 +1,44 @@
-from django.contrib.auth import get_user_model
+# === IMPORTS LIMPIOS Y CORREGIDOS ===
 from rest_framework.views import APIView
+from django.contrib.auth import get_user_model
+from django.conf import settings  # ✅ necesario para STRIPE_*
 from django.db import IntegrityError
 from django.db.models import Q, Sum, F, DecimalField, ExpressionWrapper
 from django.db.models.deletion import ProtectedError, RestrictedError
-from rest_framework import status, permissions, viewsets, filters
-from rest_framework.authentication import TokenAuthentication
-from rest_framework.decorators import api_view, permission_classes, authentication_classes, action
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
+from django.utils.decorators import method_decorator  # ✅ para @method_decorator
+from django.views.decorators.csrf import csrf_exempt
 from django.http import HttpResponse
-import csv
 from django.contrib.auth.models import Permission
+
+from rest_framework import status, permissions, viewsets, filters, generics
+from rest_framework.authentication import TokenAuthentication
+from rest_framework.decorators import (
+    api_view, permission_classes, authentication_classes, action
+)
+from rest_framework.permissions import IsAuthenticated, AllowAny  # ✅ Allowny → AllowAny
+from rest_framework.response import Response
+from rest_framework.viewsets import ReadOnlyModelViewSet  # ✅
+
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
+
 from datetime import date
-from .models import Rol, Profile, Unidad, Cuota, Pago, Infraccion
+from decimal import Decimal
+import csv
+import stripe
+
+from .models import Rol, Profile, Unidad, Cuota, Pago, Infraccion, OnlinePayment
 from .permissions import IsAdmin
 from .serializers import (
-    RegisterSerializer,
-    MeSerializer,
-    AdminUserSerializer,
-    MeUpdateSerializer,
-    ChangePasswordSerializer,
-    RolSimpleSerializer,
-    PermissionBriefSerializer, UnidadSerializer, CuotaSerializer, PagoCreateSerializer, PagoSerializer,GenerarCuotasSerializer, InfraccionSerializer,PagoEstadoCuentaSerializer,UnidadBriefECSerializer   # 👈 lo importamos (definido en serializers.py)
+    RegisterSerializer, MeSerializer, AdminUserSerializer, MeUpdateSerializer,
+    ChangePasswordSerializer, RolSimpleSerializer, PermissionBriefSerializer,
+    UnidadSerializer, CuotaSerializer, PagoCreateSerializer, PagoSerializer,
+    GenerarCuotasSerializer, InfraccionSerializer, PagoEstadoCuentaSerializer,
+    UnidadBriefECSerializer, OnlinePayInitSerializer
 )
 
 User = get_user_model()
-
-# 👤 Registrar usuario
-from rest_framework import generics
+stripe.api_key = settings.STRIPE_API_KEY
 class RegisterView(generics.CreateAPIView):
     serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
@@ -146,12 +155,11 @@ class RolViewSet(viewsets.ModelViewSet):
         data = PermissionBriefSerializer(perms, many=True).data
         return Response(data)
 
-# 📚 Catálogo de permisos (solo lectura)
-class PermissionViewSet(viewsets.ModelViewSet):
+# ✅ Mejor: solo lectura con GET (list/retrieve) para catálogo de permisos
+class PermissionViewSet(ReadOnlyModelViewSet):
     queryset = Permission.objects.select_related("content_type").all() \
         .order_by("content_type__app_label","codename")
     serializer_class = PermissionBriefSerializer
-    http_method_names = ["get"]
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated, IsAdmin]
 
@@ -429,3 +437,91 @@ class EstadoCuentaExportCSV(APIView):
             writer.writerow([p.id, p.fecha_pago, p.monto, p.medio, p.referencia, getattr(p.cuota, "periodo", ""), getattr(p.cuota, "concepto", "")])
 
         return resp
+#PAGO
+class OnlinePayInitView(APIView):
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        s = OnlinePayInitSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        cuota = s.validated_data["cuota"]
+        amount = s.validated_data["amount"]
+
+        # Crear PaymentIntent (USD en test)
+        intent = stripe.PaymentIntent.create(
+            amount=int(Decimal(amount) * 100),  # centavos
+            currency="usd",
+            metadata={"cuota_id": cuota.id, "user_id": request.user.id},
+            automatic_payment_methods={"enabled": True},
+        )
+
+        op = OnlinePayment.objects.create(
+            cuota=cuota, amount=amount, currency="USD",
+            provider="STRIPE", provider_intent_id=intent["id"],
+            status=intent["status"].upper(), created_by=request.user,
+            metadata={"client_secret": intent["client_secret"]},
+        )
+
+        # Comprobante provisional inicial
+        provisional = {
+            "online_payment_id": op.id,
+            "provider": op.provider,
+            "intent_id": op.provider_intent_id,
+            "amount": str(op.amount),
+            "currency": op.currency,
+            "status": op.status,
+        }
+
+        return Response({"client_secret": intent["client_secret"], "provisional": provisional}, status=201)
+
+
+# ✅ Webhook Stripe sin auth, con AllowAny y method_decorator correcto
+@method_decorator(csrf_exempt, name="dispatch")
+class StripeWebhookView(APIView):
+    authentication_classes = []  # Stripe no envía token
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        payload = request.body
+        sig_header = request.META.get("HTTP_STRIPE_SIGNATURE")
+        endpoint_secret = settings.STRIPE_WEBHOOK_SECRET
+        try:
+            event = stripe.Webhook.construct_event(
+                payload=payload,
+                sig_header=sig_header,
+                secret=endpoint_secret
+            )
+        except Exception:
+            return HttpResponse(status=400)
+
+        if event["type"] in ("payment_intent.succeeded", "payment_intent.payment_failed", "payment_intent.canceled"):
+            pi = event["data"]["object"]
+            intent_id = pi["id"]
+            status_ = pi["status"].upper()
+
+            op = OnlinePayment.objects.filter(
+                provider_intent_id=intent_id
+            ).select_related("cuota", "created_by").first()
+            if not op:
+                return HttpResponse(status=200)
+
+            op.status = status_
+            meta = op.metadata or {}
+            meta.update({"last_event": event["type"]})
+            op.metadata = meta
+            op.save(update_fields=["status", "metadata", "updated_at"])
+
+            if status_ == "SUCCEEDED":
+                from decimal import Decimal as D
+                if not Pago.objects.filter(referencia=intent_id, medio="ONLINE_STRIPE").exists():
+                    pago = Pago.objects.create(
+                        cuota=op.cuota,
+                        monto=D(str(op.amount)),
+                        medio="ONLINE_STRIPE",
+                        referencia=intent_id,
+                        valido=True,
+                        creado_por=op.created_by,
+                    )
+                    pago.aplicar()
+        return HttpResponse(status=200)

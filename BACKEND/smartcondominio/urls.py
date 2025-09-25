@@ -2,7 +2,7 @@ from django.urls import path
 from .views_api import (
     RegisterView, me, AdminUserViewSet, me_update, change_password,
     RolViewSet, PermissionViewSet, UnidadViewSet, CuotaViewSet, PagoViewSet,
-    InfraccionViewSet, EstadoCuentaView, EstadoCuentaExportCSV   # <-- ya lo importaste
+    InfraccionViewSet, EstadoCuentaView, EstadoCuentaExportCSV, OnlinePayInitView, StripeWebhookView   # <-- ya lo importaste
 )
 from rest_framework.routers import DefaultRouter
 from rest_framework.authtoken.views import obtain_auth_token
@@ -27,6 +27,12 @@ urlpatterns = [
     # 👇👇 NUEVOS ENDPOINTS DE ESTADO DE CUENTA
     path('estado-cuenta/', EstadoCuentaView.as_view(), name='estado-cuenta'),
     path('estado-cuenta/export/', EstadoCuentaExportCSV.as_view(), name='estado-cuenta-export'),
+    
+    #Pagos en linea
+    path('pay/online/init/', OnlinePayInitView.as_view(), name='pay_online_init'),
+    path('stripe/webhook/', StripeWebhookView.as_view(), name='stripe_webhook'),
+    
+    
 ]
 
 urlpatterns += router.urls

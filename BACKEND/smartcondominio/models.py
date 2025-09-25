@@ -1,5 +1,5 @@
 from django.db import models
-from django.db.models import Q
+from django.db.models import Q, F
 from django.contrib.auth.models import User, Permission
 from django.db.models.signals import post_save
 from django.dispatch import receiver
@@ -183,36 +183,71 @@ class Pago(models.Model):
         ("EFECTIVO", "Efectivo"),
         ("TRANSFERENCIA", "Transferencia"),
         ("TARJETA", "Tarjeta"),
+        ("ONLINE_STRIPE", "Online (Stripe)"),  # ✅ necesario para CU11
+        # opcionales a futuro:
+        # ("ONLINE_AIRTM", "Online (Airtm)"),
+        # ("ONLINE_MERU", "Online (Meru)"),
         ("OTRO", "Otro"),
     ]
-    cuota = models.ForeignKey(Cuota, on_delete=models.PROTECT, related_name="pagos")
+
+    cuota = models.ForeignKey("Cuota", on_delete=models.PROTECT, related_name="pagos")
     fecha_pago = models.DateField(auto_now_add=True)
     monto = models.DecimalField(max_digits=10, decimal_places=2)
     medio = models.CharField(max_length=20, choices=MEDIO_CHOICES, default="EFECTIVO")
-    referencia = models.CharField(max_length=100, blank=True)
+
+    # Sube max_length y agrega índice: la referencia del gateway (p.ej. intent_id)
+    referencia = models.CharField(max_length=150, blank=True, db_index=True)
+
     valido = models.BooleanField(default=True)
     creado_por = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="pagos_cargados")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["-created_at"]
+        # Evita duplicar el mismo pago del mismo gateway:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["medio", "referencia"],
+                name="uniq_pago_medio_referencia",
+                condition=~Q(referencia=""),
+            )
+        ]
 
     def __str__(self):
         return f"Pago {self.id} · Cuota {self.cuota_id} · {self.monto}"
 
     def aplicar(self):
+        """
+        Aplica el pago a la cuota de forma segura (evita condiciones de carrera).
+        """
         if not self.valido:
             return
-        self.cuota.pagado = (Decimal(self.cuota.pagado) + Decimal(self.monto)).quantize(Decimal("0.01"))
+        # Garantiza que pagado nunca sea None
+        if self.cuota.pagado is None:
+            self.cuota.pagado = Decimal("0.00")
+
+        # Suma atómica en DB
+        type(self.cuota).objects.filter(pk=self.cuota.pk).update(
+            pagado=F("pagado") + Decimal(self.monto)
+        )
+        # Refresca y recalcula estado
+        self.cuota.refresh_from_db(fields=["pagado"])
         self.cuota.recalc_estado()
-        self.cuota.save(update_fields=["pagado", "estado", "updated_at"])
+        self.cuota.save(update_fields=["estado", "updated_at"])
 
     def revertir(self):
+        """
+        Marca el pago como inválido y resta el monto de forma segura.
+        """
         if not self.valido:
             return
         self.valido = False
         self.save(update_fields=["valido"])
-        self.cuota.pagado = (Decimal(self.cuota.pagado) - Decimal(self.monto))
+
+        type(self.cuota).objects.filter(pk=self.cuota.pk).update(
+            pagado=F("pagado") - Decimal(self.monto)
+        )
+        self.cuota.refresh_from_db(fields=["pagado"])
         if self.cuota.pagado < 0:
             self.cuota.pagado = Decimal("0.00")
         self.cuota.recalc_estado()
@@ -255,3 +290,26 @@ class Infraccion(models.Model):
 
     def __str__(self):
         return f"{self.unidad_id} • {self.tipo} • {self.estado}"
+
+#PAGOS EN LINEA
+class OnlinePayment(models.Model):
+    PROVIDER_CHOICES = [("STRIPE", "Stripe")]
+    STATUS_CHOICES = [
+        ("CREATED", "Created"),
+        ("REQUIRES_ACTION", "Requires action"),
+        ("SUCCEEDED", "Succeeded"),
+        ("FAILED", "Failed"),
+        ("CANCELED", "Canceled"),
+    ]
+    cuota = models.ForeignKey("smartcondominio.Cuota", on_delete=models.PROTECT, related_name="online_payments")
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    currency = models.CharField(max_length=10, default="USD")
+    provider = models.CharField(max_length=20, choices=PROVIDER_CHOICES, default="STRIPE")
+    provider_intent_id = models.CharField(max_length=128, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="CREATED")
+    created_by = models.ForeignKey(User, null=True, on_delete=models.SET_NULL, related_name="online_payments")
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self): return f"{self.provider} • {self.cuota_id} • {self.status}"

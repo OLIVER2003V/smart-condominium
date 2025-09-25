@@ -12,6 +12,7 @@ import UnitsPage from "./pages/UnitsPage";
 import CuotasPage from "./pages/CuotasPage";
 import InfraccionesPage from "./pages/InfraccionesPagre";
 import EstadoCuentaPage from "./pages/EstadoCuentaPage";
+import PayPage from "./pages/PayPage";
 export default function App() {
   return (
     <BrowserRouter>
@@ -77,7 +78,8 @@ export default function App() {
           />
          
           <Route path="/estado-cuenta" element={<EstadoCuentaPage />} />
-
+          
+          <Route path="/pay/:id" element={<PayPage />} />
           {/* 404 dentro de la zona autenticada → lleva al dashboard */}
           <Route path="*" element={<Navigate to="dashboard" replace />} />
         </Route>

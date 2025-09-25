@@ -1,8 +1,9 @@
 from rest_framework import serializers
+from decimal import Decimal
 from django.contrib.auth import get_user_model, authenticate, password_validation
 from django.db import transaction
 from django.core.exceptions import ObjectDoesNotExist
-from .models import Profile, Rol, Unidad, Cuota, Pago, Infraccion
+from .models import Profile, Rol, Unidad, Cuota, Pago, Infraccion, OnlinePayment
 from django.contrib.auth.models import Permission  # 👈 necesario para PermissionBriefSerializer
 User = get_user_model()
 
@@ -291,6 +292,14 @@ class PagoCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError("El monto debe ser > 0.")
         return value
 
+    def validate(self, attrs):
+        # valida duplicado solo si referencia no está vacía
+        ref = (attrs.get("referencia") or "").strip()
+        medio = attrs.get("medio")
+        if ref and Pago.objects.filter(medio=medio, referencia=ref).exists():
+            raise serializers.ValidationError({"referencia": "Ya existe un pago con esa referencia para ese medio."})
+        return attrs
+
     def create(self, validated_data):
         cuota = validated_data["cuota"]
         if value_gt(validated_data["monto"], cuota.saldo):
@@ -301,10 +310,10 @@ class PagoCreateSerializer(serializers.Serializer):
             cuota=cuota,
             monto=validated_data["monto"],
             medio=validated_data.get("medio", "EFECTIVO"),
-            referencia=validated_data.get("referencia", ""),
+            referencia=(validated_data.get("referencia") or "").strip(),
             creado_por=request.user if request and request.user.is_authenticated else None,
         )
-        pago.aplicar()  # actualiza pagado/estado de la cuota
+        pago.aplicar()
         return pago
 
 # Salida (GET/response de create)
@@ -403,3 +412,34 @@ class PagoEstadoCuentaSerializer(serializers.ModelSerializer):
             return obj.cuota.unidad_id
         except Exception:
             return None
+        
+# Pagos
+class OnlinePayInitSerializer(serializers.Serializer):
+    # acepta "cuota"
+    cuota = serializers.PrimaryKeyRelatedField(queryset=Cuota.objects.all(), write_only=True, required=False)
+    # y también "cuota_id" por compatibilidad; mapea a la misma instancia "cuota"
+    cuota_id = serializers.PrimaryKeyRelatedField(source="cuota", queryset=Cuota.objects.all(), write_only=True, required=False)
+    amount = serializers.DecimalField(max_digits=10, decimal_places=2, required=False)
+
+    def to_internal_value(self, data):
+        # si mandan solo cuota_id, lo convertimos a cuota
+        if "cuota" not in data and "cuota_id" in data:
+            data = {**data, "cuota": data["cuota_id"]}
+        return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        if "cuota" not in attrs:
+            raise serializers.ValidationError({"cuota": "Este campo es obligatorio."})
+
+        cuota = attrs["cuota"]
+        amount = attrs.get("amount")
+        saldo = (cuota.total_a_pagar or Decimal("0")) - (cuota.pagado or Decimal("0"))
+        if amount is None:
+            amount = Decimal(str(saldo))
+        if amount <= 0:
+            raise serializers.ValidationError({"amount": "No hay saldo pendiente."})
+        if amount > saldo:
+            raise serializers.ValidationError({"amount": "El monto excede el saldo pendiente."})
+        attrs["amount"] = amount
+        attrs["saldo"] = saldo
+        return attrs
