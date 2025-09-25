@@ -1,5 +1,5 @@
 from django.db import models
-from django.db.models import Q
+from django.db.models import Q, F
 from django.contrib.auth.models import User, Permission
 from django.db.models.signals import post_save
 from django.dispatch import receiver
@@ -183,36 +183,71 @@ class Pago(models.Model):
         ("EFECTIVO", "Efectivo"),
         ("TRANSFERENCIA", "Transferencia"),
         ("TARJETA", "Tarjeta"),
+        ("ONLINE_STRIPE", "Online (Stripe)"),  # ✅ necesario para CU11
+        # opcionales a futuro:
+        # ("ONLINE_AIRTM", "Online (Airtm)"),
+        # ("ONLINE_MERU", "Online (Meru)"),
         ("OTRO", "Otro"),
     ]
-    cuota = models.ForeignKey(Cuota, on_delete=models.PROTECT, related_name="pagos")
+
+    cuota = models.ForeignKey("Cuota", on_delete=models.PROTECT, related_name="pagos")
     fecha_pago = models.DateField(auto_now_add=True)
     monto = models.DecimalField(max_digits=10, decimal_places=2)
     medio = models.CharField(max_length=20, choices=MEDIO_CHOICES, default="EFECTIVO")
-    referencia = models.CharField(max_length=100, blank=True)
+
+    # Sube max_length y agrega índice: la referencia del gateway (p.ej. intent_id)
+    referencia = models.CharField(max_length=150, blank=True, db_index=True)
+
     valido = models.BooleanField(default=True)
     creado_por = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name="pagos_cargados")
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["-created_at"]
+        # Evita duplicar el mismo pago del mismo gateway:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["medio", "referencia"],
+                name="uniq_pago_medio_referencia",
+                condition=~Q(referencia=""),
+            )
+        ]
 
     def __str__(self):
         return f"Pago {self.id} · Cuota {self.cuota_id} · {self.monto}"
 
     def aplicar(self):
+        """
+        Aplica el pago a la cuota de forma segura (evita condiciones de carrera).
+        """
         if not self.valido:
             return
-        self.cuota.pagado = (Decimal(self.cuota.pagado) + Decimal(self.monto)).quantize(Decimal("0.01"))
+        # Garantiza que pagado nunca sea None
+        if self.cuota.pagado is None:
+            self.cuota.pagado = Decimal("0.00")
+
+        # Suma atómica en DB
+        type(self.cuota).objects.filter(pk=self.cuota.pk).update(
+            pagado=F("pagado") + Decimal(self.monto)
+        )
+        # Refresca y recalcula estado
+        self.cuota.refresh_from_db(fields=["pagado"])
         self.cuota.recalc_estado()
-        self.cuota.save(update_fields=["pagado", "estado", "updated_at"])
+        self.cuota.save(update_fields=["estado", "updated_at"])
 
     def revertir(self):
+        """
+        Marca el pago como inválido y resta el monto de forma segura.
+        """
         if not self.valido:
             return
         self.valido = False
         self.save(update_fields=["valido"])
-        self.cuota.pagado = (Decimal(self.cuota.pagado) - Decimal(self.monto))
+
+        type(self.cuota).objects.filter(pk=self.cuota.pk).update(
+            pagado=F("pagado") - Decimal(self.monto)
+        )
+        self.cuota.refresh_from_db(fields=["pagado"])
         if self.cuota.pagado < 0:
             self.cuota.pagado = Decimal("0.00")
         self.cuota.recalc_estado()
@@ -255,245 +290,26 @@ class Infraccion(models.Model):
 
     def __str__(self):
         return f"{self.unidad_id} • {self.tipo} • {self.estado}"
-    
-# --- CU13: Avisos / Comunicados (sin FileField) ---
-from django.utils import timezone
 
-class Aviso(models.Model):
-    AUDIENCE_CHOICES = [
-        ("ALL", "Todos"),
-        ("TORRE", "Por torre"),
-        ("UNIDAD", "Por unidad"),
-        ("ROL", "Por rol"),
-    ]
+#PAGOS EN LINEA
+class OnlinePayment(models.Model):
+    PROVIDER_CHOICES = [("STRIPE", "Stripe")]
     STATUS_CHOICES = [
-        ("BORRADOR", "Borrador"),
-        ("PROGRAMADO", "Programado"),
-        ("PUBLICADO", "Publicado"),
-        ("ARCHIVADO", "Archivado"),
+        ("CREATED", "Created"),
+        ("REQUIRES_ACTION", "Requires action"),
+        ("SUCCEEDED", "Succeeded"),
+        ("FAILED", "Failed"),
+        ("CANCELED", "Canceled"),
     ]
-
-    titulo = models.CharField(max_length=200)
-    cuerpo = models.TextField()
-
-    # audiencia
-    audiencia = models.CharField(max_length=10, choices=AUDIENCE_CHOICES, default="ALL")
-    torre = models.CharField(max_length=100, blank=True)  # cuando audiencia=TORRE
-    unidades = models.ManyToManyField("smartcondominio.Unidad", blank=True)
-    roles = models.ManyToManyField("smartcondominio.Rol", blank=True)
-
-    # publicación
-    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default="BORRADOR")
-    publish_at = models.DateTimeField(null=True, blank=True)
-    expires_at = models.DateTimeField(null=True, blank=True)
-
-    # notificación (placeholders)
-    notify_inapp = models.BooleanField(default=True)
-    notify_email = models.BooleanField(default=False)
-    notify_push = models.BooleanField(default=False)
-
-    # adjuntos como URLs (Drive/S3/lo que uses)
-    adjuntos = models.JSONField(default=list, blank=True)  # p.ej: ["https://.../archivo.pdf", ...]
-
-    # auditoría
-    creado_por = models.ForeignKey(User, null=True, on_delete=models.SET_NULL, related_name="avisos_creados")
-    is_active = models.BooleanField(default=True)
+    cuota = models.ForeignKey("smartcondominio.Cuota", on_delete=models.PROTECT, related_name="online_payments")
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    currency = models.CharField(max_length=10, default="USD")
+    provider = models.CharField(max_length=20, choices=PROVIDER_CHOICES, default="STRIPE")
+    provider_intent_id = models.CharField(max_length=128, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="CREATED")
+    created_by = models.ForeignKey(User, null=True, on_delete=models.SET_NULL, related_name="online_payments")
+    metadata = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-    class Meta:
-        ordering = ["-publish_at", "-created_at"]
-        indexes = [
-            models.Index(fields=["audiencia", "status"]),
-            models.Index(fields=["publish_at"]),
-        ]
-
-    def __str__(self):
-        return f"[{self.status}] {self.titulo}"
-
-    def es_visible(self, now=None):
-        now = now or timezone.now()
-        if not self.is_active:
-            return False
-        if self.status != "PUBLICADO":
-            return False
-        if self.publish_at and self.publish_at > now:
-            return False
-        if self.expires_at and self.expires_at < now:
-            return False
-        return True
-
-    def publicar_ahora(self):
-        self.status = "PUBLICADO"
-        if not self.publish_at:
-            self.publish_at = timezone.now()
-
-# ====== TAREAS (CU15/CU24) ======
-
-from django.db import models
-from django.contrib.auth import get_user_model
-from django.db.models import Q
-from django.utils import timezone
-
-User = get_user_model()
-
-class Tarea(models.Model):
-    PRIORIDAD_CHOICES = [
-        ("BAJA", "Baja"),
-        ("MEDIA", "Media"),
-        ("ALTA", "Alta"),
-        ("URGENTE", "Urgente"),
-    ]
-    ESTADO_CHOICES = [
-        ("NUEVA", "Nueva"),
-        ("ASIGNADA", "Asignada"),
-        ("EN_PROGRESO", "En progreso"),
-        ("BLOQUEADA", "Bloqueada"),
-        ("COMPLETADA", "Completada"),
-        ("CANCELADA", "Cancelada"),
-    ]
-
-    # Básico
-    titulo = models.CharField(max_length=200)
-    descripcion = models.TextField(blank=True)
-
-    # Contexto
-    unidad = models.ForeignKey("smartcondominio.Unidad", null=True, blank=True, on_delete=models.SET_NULL, related_name="tareas")
-
-    # Asignación
-    asignado_a = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="tareas_asignadas")
-    asignado_a_rol = models.ForeignKey("smartcondominio.Rol", null=True, blank=True, on_delete=models.SET_NULL, related_name="tareas_de_rol")
-    watchers = models.ManyToManyField(User, blank=True, related_name="tareas_watch")
-
-    # Gestión
-    prioridad = models.CharField(max_length=10, choices=PRIORIDAD_CHOICES, default="MEDIA")
-    estado = models.CharField(max_length=12, choices=ESTADO_CHOICES, default="NUEVA")
-    fecha_inicio = models.DateField(null=True, blank=True)
-    fecha_limite = models.DateField(null=True, blank=True)
-
-    # Adjuntos/Checklist (como URLs/ítems para no usar FileField en Render)
-    adjuntos = models.JSONField(default=list, blank=True)
-    checklist = models.JSONField(default=list, blank=True)  # [{text: str, done: bool}]
-
-    # Auditoría
-    creado_por = models.ForeignKey(User, null=True, on_delete=models.SET_NULL, related_name="tareas_creadas")
-    is_active = models.BooleanField(default=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        ordering = ["-updated_at", "-created_at"]
-        permissions = [
-            ("manage_tasks", "Puede gestionar y asignar tareas"),  # 👈 nuevo
-        ]
-    def __str__(self):
-        return f"[{self.id}] {self.titulo}"
-
-    @property
-    def atrasada(self) -> bool:
-        return bool(self.fecha_limite and timezone.localdate() > self.fecha_limite and self.estado not in {"COMPLETADA", "CANCELADA"})
-
-class TareaComentario(models.Model):
-    tarea = models.ForeignKey(Tarea, on_delete=models.CASCADE, related_name="comentarios")
-    autor = models.ForeignKey(User, null=True, on_delete=models.SET_NULL, related_name="tarea_comentarios")
-    cuerpo = models.TextField()
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        ordering = ["created_at"]
-
-    def __str__(self):
-        return f"Coment {self.id} · Tarea {self.tarea_id}"
-
-
-# ========= CU16: MODELOS DE ÁREAS COMUNES =========
-from django.conf import settings
-from django.db import models
-from django.utils import timezone
-
-class AreaComun(models.Model):
-    nombre = models.CharField(max_length=120, unique=True)
-    descripcion = models.TextField(blank=True)
-    ubicacion = models.CharField(max_length=120, blank=True)
-    capacidad = models.PositiveIntegerField(default=1)
-    costo_por_hora = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    activa = models.BooleanField(default=True)
-    requiere_aprobacion = models.BooleanField(default=False)
-    creado_en = models.DateTimeField(auto_now_add=True)
-    actualizado_en = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        verbose_name = "Área Común"
-        verbose_name_plural = "Áreas Comunes"
-
-    def __str__(self):
-        return self.nombre
-
-
-class AreaDisponibilidad(models.Model):
-    """
-    Ventanas de disponibilidad por día de la semana (0=Lunes ... 6=Domingo).
-    """
-    DIA_CHOICES = [
-        (0, "Lunes"), (1, "Martes"), (2, "Miércoles"),
-        (3, "Jueves"), (4, "Viernes"), (5, "Sábado"), (6, "Domingo"),
-    ]
-    area = models.ForeignKey(AreaComun, on_delete=models.CASCADE, related_name="reglas")
-    dia_semana = models.SmallIntegerField(choices=DIA_CHOICES)
-    hora_inicio = models.TimeField()
-    hora_fin = models.TimeField()
-    max_horas_por_reserva = models.PositiveIntegerField(default=4)
-
-    class Meta:
-        ordering = ["area", "dia_semana", "hora_inicio"]
-        constraints = [
-            models.CheckConstraint(
-                check=models.Q(hora_fin__gt=models.F("hora_inicio")),
-                name="area_disp_hora_fin_gt_inicio"
-            ),
-            models.UniqueConstraint(
-                fields=["area", "dia_semana", "hora_inicio", "hora_fin"],
-                name="area_disp_uniq_window"
-            ),
-        ]
-
-    def __str__(self):
-        return f"{self.area} - {self.get_dia_semana_display()} {self.hora_inicio}-{self.hora_fin}"
-
-
-class ReservaArea(models.Model):
-    """
-    Usada para calcular disponibilidad (evitar solapamientos).
-    CU17/CU18 la usarán para crear/confirmar/cobrar.
-    """
-    ESTADOS = [
-        ("PENDIENTE", "Pendiente"),
-        ("CONFIRMADA", "Confirmada"),
-        ("PAGADA", "Pagada"),
-        ("CANCELADA", "Cancelada"),
-        ("RECHAZADA", "Rechazada"),
-    ]
-
-    area = models.ForeignKey(AreaComun, on_delete=models.CASCADE, related_name="reservas")
-    unidad = models.ForeignKey("smartcondominio.Unidad", on_delete=models.SET_NULL, null=True, blank=True, related_name="reservas_area")
-    usuario = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="reservas_area")
-
-    fecha_inicio = models.DateTimeField()
-    fecha_fin = models.DateTimeField()
-    estado = models.CharField(max_length=12, choices=ESTADOS, default="PENDIENTE")
-
-    monto_total = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    nota = models.TextField(blank=True)
-
-    creado_en = models.DateTimeField(auto_now_add=True)
-    actualizado_en = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        indexes = [
-            models.Index(fields=["area", "fecha_inicio", "fecha_fin"]),
-            models.Index(fields=["estado"]),
-        ]
-        ordering = ["-fecha_inicio"]
-
-    def __str__(self):
-        return f"{self.area} {self.fecha_inicio} - {self.fecha_fin} ({self.estado})"
+    def __str__(self): return f"{self.provider} • {self.cuota_id} • {self.status}"

@@ -1,4 +1,3 @@
-// src/App.jsx
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import Signin from "./pages/Signin";
 import Dashboard from "./pages/Dashboard";
@@ -6,28 +5,14 @@ import Me from "./pages/Me";
 import Layout from "./components/Layout";
 import RequireAuth from "./components/RequireAuth";
 import RequireRole from "./components/RequireRole";
-
-import AdminUsers from "./pages/AdminUsers";
-import RolesPermisos from "./pages/RolesPermisos";
+import AdminUsers from "./pages/AdminUsers"; 
+import RolesPage from "./pages/Roles";
+import Permisos from "./pages/Permisos";
 import UnitsPage from "./pages/UnitsPage";
 import CuotasPage from "./pages/CuotasPage";
 import InfraccionesPage from "./pages/InfraccionesPagre";
 import EstadoCuentaPage from "./pages/EstadoCuentaPage";
-import AdminAvisosPage from "./pages/AdminAvisosPage";
-import MisAvisosPage from "./pages/MisAvisosPage";
-
-import AdminTareasPage from "./pages/AdminTareasPage";
-import MisTareasPage from "./pages/MisTareasPage";
-
-// NUEVO
-import AsignarTareasPage from "./pages/AsignarTareasPage";
-
-// Áreas comunes
-import AreasDisponibilidad from "./pages/AreasDisponibilidad"; // CU16
-import AreaReservaNueva from "./pages/AreaReservaNueva"; // CU17
-import AdminAreasPage from "./pages/AdminAreasPage"; // gestión de áreas
-import AdminAreaReglasPage from "./pages/AdminAreaReglasPage"; // CU19 (NUEVO)
-
+import PayPage from "./pages/PayPage";
 export default function App() {
   return (
     <BrowserRouter>
@@ -36,42 +21,42 @@ export default function App() {
         <Route path="/signin" element={<Signin />} />
 
         {/* Zona autenticada */}
-        <Route
-          path="/"
-          element={
-            <RequireAuth>
-              <Layout />
-            </RequireAuth>
-          }
-        >
+        <Route path="/" element={<RequireAuth><Layout /></RequireAuth>}>
           <Route index element={<Navigate to="dashboard" replace />} />
           <Route path="dashboard" element={<Dashboard />} />
           <Route path="me" element={<Me />} />
 
-          {/* Usuarios */}
+          {/* Solo ADMIN */}
           <Route
             path="admin/usuarios"
             element={
-              <RequireRole allow={["ADMIN", "STAFF"]}>
+              <RequireRole allow={["ADMIN"]}>
                 <AdminUsers />
               </RequireRole>
             }
           />
+          {/* Solo ADMIN para los roles */}
           <Route
-            path="/admin/roles-permisos"
+            path="admin/roles"
             element={
-              <RequireRole roles={["ADMIN"]}>
-                <RolesPermisos />
+              <RequireRole allow={["ADMIN"]}>
+                <RolesPage />
               </RequireRole>
             }
           />
-
-          {/* Unidades, cuotas, infracciones */}
+          <Route
+            path="admin/permissions"
+            element={
+              <RequireRole allow={["ADMIN"]}>
+                <Permisos /> {/* 👈 nueva página */}
+              </RequireRole>
+            }
+          />
           <Route
             path="admin/unidades"
             element={
               <RequireRole allow={["ADMIN"]}>
-                <UnitsPage />
+                <UnitsPage /> {/* 👈 nueva página */}
               </RequireRole>
             }
           />
@@ -79,7 +64,7 @@ export default function App() {
             path="admin/cuotas"
             element={
               <RequireRole allow={["ADMIN"]}>
-                <CuotasPage />
+                <CuotasPage /> {/* 👈 nueva página */}
               </RequireRole>
             }
           />
@@ -87,76 +72,22 @@ export default function App() {
             path="admin/infracciones"
             element={
               <RequireRole allow={["ADMIN"]}>
-                <InfraccionesPage />
+                <InfraccionesPage /> {/* 👈 nueva página */}
               </RequireRole>
             }
           />
-
-          {/* Avisos */}
-          <Route
-            path="admin/avisos"
-            element={
-              <RequireRole allow={["ADMIN"]}>
-                <AdminAvisosPage />
-              </RequireRole>
-            }
-          />
-          <Route path="avisos" element={<MisAvisosPage />} />
-
-          {/* Tareas */}
-          <Route
-            path="admin/tareas"
-            element={
-              <RequireRole allow={["ADMIN", "STAFF"]}>
-                <AdminTareasPage />
-              </RequireRole>
-            }
-          />
-          <Route path="tareas" element={<MisTareasPage />} />
-
-          {/* NUEVO: Asignar tareas */}
-          <Route
-            path="admin/asignar-tareas"
-            element={
-              <RequireRole allow={["ADMIN", "STAFF"]}>
-                <AsignarTareasPage />
-              </RequireRole>
-            }
-          />
-
-          {/* Estado de cuenta */}
+         
           <Route path="/estado-cuenta" element={<EstadoCuentaPage />} />
-
-          {/* Áreas Comunes (usuarios) */}
-          <Route
-            path="areas/disponibilidad"
-            element={<AreasDisponibilidad />}
-          />
-          <Route path="areas/reservar" element={<AreaReservaNueva />} />
-
-          {/* Áreas Comunes (admin) */}
-          <Route
-            path="admin/areas-comunes"
-            element={
-              <RequireRole allow={["ADMIN"]}>
-                <AdminAreasPage />
-              </RequireRole>
-            }
-          />
-          <Route
-            path="admin/areas-comunes/reglas"
-            element={
-              <RequireRole allow={["ADMIN"]}>
-                <AdminAreaReglasPage />
-              </RequireRole>
-            }
-          />
-
-          {/* 404 dentro autenticado */}
+          
+          <Route path="/pay/:id" element={<PayPage />} />
+          {/* 404 dentro de la zona autenticada → lleva al dashboard */}
           <Route path="*" element={<Navigate to="dashboard" replace />} />
         </Route>
+        
+          
 
-        {/* 404 global */}
+
+        {/* 404 global (no autenticado) → login */}
         <Route path="*" element={<Navigate to="/signin" replace />} />
       </Routes>
     </BrowserRouter>

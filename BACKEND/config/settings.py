@@ -164,8 +164,7 @@ REST_FRAMEWORK = {
 }
 
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-# === Archivos de usuario (MEDIA) ===
-MEDIA_URL = "/media/"
-MEDIA_ROOT = BASE_DIR / "media"
 
-# WhiteNoise sirve SOLO estáticos, no media. Para prod conviene S3; en dev servimos con Django.
+
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")  
+STRIPE_WEBHOOK_SECRET = "pk_test_51SAdq5JTfHQ9Yp3bryD3txdxm08Cfo8uAJDKbCJsbW0v2u2Z1eE7VgLhLkwXHf3dXf6OA1pc5uUVI04w0h5LCaot00sKJMqulP"

@@ -1,8 +1,9 @@
 from rest_framework import serializers
+from decimal import Decimal
 from django.contrib.auth import get_user_model, authenticate, password_validation
 from django.db import transaction
 from django.core.exceptions import ObjectDoesNotExist
-from .models import Profile, Rol, Unidad, Cuota, Pago, Infraccion
+from .models import Profile, Rol, Unidad, Cuota, Pago, Infraccion, OnlinePayment
 from django.contrib.auth.models import Permission  # 👈 necesario para PermissionBriefSerializer
 User = get_user_model()
 
@@ -50,7 +51,6 @@ class RegisterSerializer(serializers.ModelSerializer):
         role = _resolve_role(role_id, role_code, default_code="RESIDENT")
         Profile.objects.update_or_create(user=user, defaults={"role": role})
         return user
-
 
 # ---------- Admin: CRUD usuarios ----------
 class AdminUserSerializer(serializers.ModelSerializer):
@@ -292,6 +292,14 @@ class PagoCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError("El monto debe ser > 0.")
         return value
 
+    def validate(self, attrs):
+        # valida duplicado solo si referencia no está vacía
+        ref = (attrs.get("referencia") or "").strip()
+        medio = attrs.get("medio")
+        if ref and Pago.objects.filter(medio=medio, referencia=ref).exists():
+            raise serializers.ValidationError({"referencia": "Ya existe un pago con esa referencia para ese medio."})
+        return attrs
+
     def create(self, validated_data):
         cuota = validated_data["cuota"]
         if value_gt(validated_data["monto"], cuota.saldo):
@@ -302,10 +310,10 @@ class PagoCreateSerializer(serializers.Serializer):
             cuota=cuota,
             monto=validated_data["monto"],
             medio=validated_data.get("medio", "EFECTIVO"),
-            referencia=validated_data.get("referencia", ""),
+            referencia=(validated_data.get("referencia") or "").strip(),
             creado_por=request.user if request and request.user.is_authenticated else None,
         )
-        pago.aplicar()  # actualiza pagado/estado de la cuota
+        pago.aplicar()
         return pago
 
 # Salida (GET/response de create)
@@ -405,181 +413,33 @@ class PagoEstadoCuentaSerializer(serializers.ModelSerializer):
         except Exception:
             return None
         
-from rest_framework import serializers
-from .models import Aviso, Unidad, Rol
+# Pagos
+class OnlinePayInitSerializer(serializers.Serializer):
+    # acepta "cuota"
+    cuota = serializers.PrimaryKeyRelatedField(queryset=Cuota.objects.all(), write_only=True, required=False)
+    # y también "cuota_id" por compatibilidad; mapea a la misma instancia "cuota"
+    cuota_id = serializers.PrimaryKeyRelatedField(source="cuota", queryset=Cuota.objects.all(), write_only=True, required=False)
+    amount = serializers.DecimalField(max_digits=10, decimal_places=2, required=False)
 
-class AvisoSerializer(serializers.ModelSerializer):
-    unidades = serializers.PrimaryKeyRelatedField(queryset=Unidad.objects.all(), many=True, required=False)
-    roles = serializers.PrimaryKeyRelatedField(queryset=Rol.objects.all(), many=True, required=False)
-    # Lista de URLs
-    adjuntos = serializers.ListField(
-        child=serializers.URLField(max_length=1000),
-        required=False,
-        allow_empty=True
-    )
+    def to_internal_value(self, data):
+        # si mandan solo cuota_id, lo convertimos a cuota
+        if "cuota" not in data and "cuota_id" in data:
+            data = {**data, "cuota": data["cuota_id"]}
+        return super().to_internal_value(data)
 
-    class Meta:
-        model = Aviso
-        fields = [
-            "id", "titulo", "cuerpo",
-            "audiencia", "torre", "unidades", "roles",
-            "status", "publish_at", "expires_at",
-            "notify_inapp", "notify_email", "notify_push",
-            "adjuntos",
-            "creado_por", "created_at", "updated_at", "is_active",
-        ]
-        read_only_fields = ["creado_por", "created_at", "updated_at"]
+    def validate(self, attrs):
+        if "cuota" not in attrs:
+            raise serializers.ValidationError({"cuota": "Este campo es obligatorio."})
 
-    def validate(self, data):
-        aud = data.get("audiencia", getattr(self.instance, "audiencia", "ALL"))
-        if aud == "TORRE":
-            if not data.get("torre", getattr(self.instance, "torre", "")):
-                raise serializers.ValidationError({"torre": "Requerido cuando audiencia=TORRE."})
-        if aud == "UNIDAD":
-            unidades = data.get("unidades") or []
-            if isinstance(unidades, list) and len(unidades) == 0:
-                raise serializers.ValidationError({"unidades": "Debe seleccionar al menos una unidad."})
-        if aud == "ROL":
-            roles = data.get("roles") or []
-            if isinstance(roles, list) and len(roles) == 0:
-                raise serializers.ValidationError({"roles": "Debe seleccionar al menos un rol."})
-
-        status_ = data.get("status", getattr(self.instance, "status", "BORRADOR"))
-        publish_at = data.get("publish_at", getattr(self.instance, "publish_at", None))
-        if status_ == "PROGRAMADO" and not publish_at:
-            raise serializers.ValidationError({"publish_at": "Requerido cuando status=PROGRAMADO."})
-        return data
-
-    def create(self, validated):
-        validated["creado_por"] = self.context["request"].user
-        return super().create(validated)
-
-# ====== SERIALIZERS TAREAS ======
-# --- IMPORTS necesarios (ajústalos si ya los tienes en tu archivo) ---
-from rest_framework import serializers
-from django.contrib.auth.models import User
-from .models import Tarea, TareaComentario, Unidad, Rol
-
-# Breves
-class UserBriefSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = User
-        fields = ("id", "username", "first_name", "last_name", "email")
-
-class RolBriefSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Rol
-        fields = ("id", "code", "name")
-
-class UnidadBriefSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Unidad
-        fields = ("id", "torre", "bloque", "numero")
-
-# Comentarios
-class TareaComentarioSerializer(serializers.ModelSerializer):
-    autor = UserBriefSerializer(read_only=True)
-
-    class Meta:
-        model = TareaComentario
-        fields = ("id", "cuerpo", "autor", "created_at")
-
-# Tareas
-class TareaSerializer(serializers.ModelSerializer):
-    """
-    Escritura: acepta PK en unidad/asignado_a/asignado_a_rol.
-    Lectura: expone objetos *_info y lista de comentarios.
-    """
-    # Escritura (PKs)
-    unidad = serializers.PrimaryKeyRelatedField(
-        queryset=Unidad.objects.all(), allow_null=True, required=False
-    )
-    asignado_a = serializers.PrimaryKeyRelatedField(
-        queryset=User.objects.all(), allow_null=True, required=False
-    )
-    asignado_a_rol = serializers.PrimaryKeyRelatedField(
-        queryset=Rol.objects.all(), allow_null=True, required=False
-    )
-
-    # Lectura (anidados)
-    unidad_info = UnidadBriefSerializer(source="unidad", read_only=True)
-    asignado_a_info = UserBriefSerializer(source="asignado_a", read_only=True)
-    asignado_a_rol_info = RolBriefSerializer(source="asignado_a_rol", read_only=True)
-
-    # Reverse FK (requires related_name="comentarios" en TareaComentario.tarea)
-    comentarios = TareaComentarioSerializer(many=True, read_only=True)
-
-    class Meta:
-        model = Tarea
-        fields = (
-            "id",
-            "titulo",
-            "descripcion",
-            "prioridad",
-            "estado",
-            "fecha_inicio",
-            "fecha_limite",
-            "unidad", "unidad_info",
-            "asignado_a", "asignado_a_info",
-            "asignado_a_rol", "asignado_a_rol_info",
-            "adjuntos",
-            "checklist",
-            "is_active",
-            "created_at",
-            "updated_at",
-            "creado_por",
-            "comentarios",   # 👈 IMPORTANTE: ahora sí está en fields
-        )
-        read_only_fields = ("is_active", "created_at", "updated_at", "creado_por")
-
-    # Opcional: normaliza 'dd/mm/yyyy' → date
-    def _norm_date(self, v):
-        if not v:
-            return v
-        if isinstance(v, str):
-            import re, datetime
-            m = re.match(r"^(\d{2})/(\d{2})/(\d{4})$", v)
-            if m:
-                return datetime.date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
-        return v
-
-    def validate_fecha_inicio(self, v):
-        return self._norm_date(v)
-
-    def validate_fecha_limite(self, v):
-        return self._norm_date(v)
-class TareaWriteSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Tarea
-        fields = (
-            "titulo", "descripcion", "prioridad", "estado",
-            "unidad", "asignado_a", "asignado_a_rol",
-            "fecha_inicio", "fecha_limite", "adjuntos", "checklist",
-        )
-
-# ========= CU16: SERIALIZERS DE ÁREAS =========
-from rest_framework import serializers
-from .models import AreaComun
-
-class AreaComunSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = AreaComun
-        fields = [
-            "id", "nombre", "descripcion", "ubicacion",
-            "capacidad", "costo_por_hora", "activa", "requiere_aprobacion"
-        ]
-
-class AreaDisponibilidadWindowSerializer(serializers.Serializer):
-    start = serializers.TimeField()
-    end = serializers.TimeField()
-
-class SlotSerializer(serializers.Serializer):
-    start = serializers.DateTimeField()
-    end = serializers.DateTimeField()
-
-class DisponibilidadResponseSerializer(serializers.Serializer):
-    area_id = serializers.IntegerField()
-    date = serializers.DateField()
-    slot_minutes = serializers.IntegerField()
-    windows = AreaDisponibilidadWindowSerializer(many=True)
-    slots = SlotSerializer(many=True)
+        cuota = attrs["cuota"]
+        amount = attrs.get("amount")
+        saldo = (cuota.total_a_pagar or Decimal("0")) - (cuota.pagado or Decimal("0"))
+        if amount is None:
+            amount = Decimal(str(saldo))
+        if amount <= 0:
+            raise serializers.ValidationError({"amount": "No hay saldo pendiente."})
+        if amount > saldo:
+            raise serializers.ValidationError({"amount": "El monto excede el saldo pendiente."})
+        attrs["amount"] = amount
+        attrs["saldo"] = saldo
+        return attrs

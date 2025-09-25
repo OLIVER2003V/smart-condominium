@@ -1,94 +1,63 @@
-from django.contrib.auth import get_user_model
+# === IMPORTS LIMPIOS Y CORREGIDOS ===
 from rest_framework.views import APIView
+from django.contrib.auth import get_user_model
+from django.conf import settings  # ✅ necesario para STRIPE_*
 from django.db import IntegrityError
 from django.db.models import Q, Sum, F, DecimalField, ExpressionWrapper
 from django.db.models.deletion import ProtectedError, RestrictedError
-from rest_framework import status, permissions, viewsets, filters
-from rest_framework.authentication import TokenAuthentication
-from rest_framework.decorators import api_view, permission_classes, authentication_classes, action
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
+from django.utils.decorators import method_decorator  # ✅ para @method_decorator
+from django.views.decorators.csrf import csrf_exempt
 from django.http import HttpResponse
-import csv
 from django.contrib.auth.models import Permission
+
+from rest_framework import status, permissions, viewsets, filters, generics
+from rest_framework.authentication import TokenAuthentication
+from rest_framework.decorators import (
+    api_view, permission_classes, authentication_classes, action
+)
+from rest_framework.permissions import IsAuthenticated, AllowAny  # ✅ Allowny → AllowAny
+from rest_framework.response import Response
+from rest_framework.viewsets import ReadOnlyModelViewSet  # ✅
+
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
+
 from datetime import date
-from .models import Rol, Profile, Unidad, Cuota, Pago, Infraccion
+from decimal import Decimal
+import csv
+import stripe
+
+from .models import Rol, Profile, Unidad, Cuota, Pago, Infraccion, OnlinePayment
 from .permissions import IsAdmin
-from .permissions import user_role_code, has_role_permission
 from .serializers import (
-    RegisterSerializer,
-    MeSerializer,
-    AdminUserSerializer,
-    MeUpdateSerializer,
-    ChangePasswordSerializer,
-    RolSimpleSerializer,
-    PermissionBriefSerializer, UnidadSerializer, CuotaSerializer, PagoCreateSerializer, PagoSerializer,GenerarCuotasSerializer, InfraccionSerializer,PagoEstadoCuentaSerializer,UnidadBriefECSerializer   # 👈 lo importamos (definido en serializers.py)
+    RegisterSerializer, MeSerializer, AdminUserSerializer, MeUpdateSerializer,
+    ChangePasswordSerializer, RolSimpleSerializer, PermissionBriefSerializer,
+    UnidadSerializer, CuotaSerializer, PagoCreateSerializer, PagoSerializer,
+    GenerarCuotasSerializer, InfraccionSerializer, PagoEstadoCuentaSerializer,
+    UnidadBriefECSerializer, OnlinePayInitSerializer
 )
-from .models import Aviso, Unidad
-from .serializers import AvisoSerializer
-from .permissions import IsAdmin, user_role_code
-from django.utils import timezone
-from django.db import models
-from .models import Tarea, TareaComentario  # + ya tienes Unidad, etc.
-from .serializers import (
-    # ... lo que ya tienes ...
-    TareaSerializer, TareaWriteSerializer, TareaComentarioSerializer,
-)
-from .permissions import IsAdmin, IsStaff
 
 User = get_user_model()
-
-# 👤 Registrar usuario
-# 👤 Registrar usuario
-from rest_framework import generics
+stripe.api_key = settings.STRIPE_API_KEY
 class RegisterView(generics.CreateAPIView):
     serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
 
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        user = serializer.save()
-        data = AdminUserSerializer(user).data
-        return Response(
-            {
-                "status": 1,
-                "error": 0,
-                "message": "REGISTRO EXITOSO",
-                "values": {"user": data},
-            },
-            status=status.HTTP_201_CREATED,
-        )
-
-
 # 👥 Admin de usuarios
-# --- REEMPLAZO COMPLETO DE AdminUserViewSet ---
 class AdminUserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.select_related("profile__role").all().order_by("id")
     serializer_class = AdminUserSerializer
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated, IsAdmin]
 
-    # búsquedas / orden / filtros
-    from django_filters.rest_framework import DjangoFilterBackend
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    # búsquedas y orden
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["username", "first_name", "last_name", "email", "profile__role__code", "profile__role__name"]
     ordering_fields = ["id", "username", "email", "first_name", "last_name", "is_active"]
-    filterset_fields = ["is_active", "is_superuser", "profile__role__code"]
-
-    def get_queryset(self):
-        qs = super().get_queryset()
-        group = self.request.query_params.get("group")
-        if group == "residents":
-            qs = qs.filter(profile__role__code="RESIDENT")
-        elif group == "staff":
-            qs = qs.filter(Q(profile__role__code__in=["STAFF", "ADMIN"]) | Q(is_superuser=True))
-        return qs
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
+
         if instance.pk == request.user.pk:
             return Response({"detail": "No puedes eliminar tu propia cuenta."},
                             status=status.HTTP_400_BAD_REQUEST)
@@ -106,31 +75,20 @@ class AdminUserViewSet(viewsets.ModelViewSet):
         try:
             self.perform_destroy(instance)
         except (ProtectedError, RestrictedError):
-            return Response({"detail": "No se puede eliminar: tiene registros relacionados (integridad referencial)."},
-                            status=status.HTTP_409_CONFLICT)
+            return Response(
+                {"detail": "No se puede eliminar: tiene registros relacionados (integridad referencial)."},
+                status=status.HTTP_409_CONFLICT
+            )
         except IntegrityError as e:
-            return Response({"detail": "No se puede eliminar por integridad referencial.", "error": str(e)},
-                            status=status.HTTP_409_CONFLICT)
+            return Response(
+                {"detail": "No se puede eliminar por integridad referencial.", "error": str(e)},
+                status=status.HTTP_409_CONFLICT
+            )
         except Exception as e:
             return Response({"detail": "Error inesperado al eliminar.", "error": str(e)},
                             status=status.HTTP_400_BAD_REQUEST)
+
         return Response(status=status.HTTP_204_NO_CONTENT)
-
-    # listas rápidas
-    @action(detail=False, methods=["get"], url_path="residents")
-    def residents(self, request):
-        qs = self.filter_queryset(self.get_queryset().filter(profile__role__code="RESIDENT"))
-        page = self.paginate_queryset(qs)
-        ser = self.get_serializer(page or qs, many=True)
-        return self.get_paginated_response(ser.data) if page is not None else Response(ser.data)
-
-    @action(detail=False, methods=["get"], url_path="staff")
-    def staff(self, request):
-        qs = self.filter_queryset(self.get_queryset().filter(Q(profile__role__code__in=["STAFF", "ADMIN"]) | Q(is_superuser=True)))
-        page = self.paginate_queryset(qs)
-        ser = self.get_serializer(page or qs, many=True)
-        return self.get_paginated_response(ser.data) if page is not None else Response(ser.data)
-
 
 # 🔒 Perfil del usuario autenticado
 @api_view(["GET"])
@@ -197,12 +155,11 @@ class RolViewSet(viewsets.ModelViewSet):
         data = PermissionBriefSerializer(perms, many=True).data
         return Response(data)
 
-# 📚 Catálogo de permisos (solo lectura)
-class PermissionViewSet(viewsets.ModelViewSet):
+# ✅ Mejor: solo lectura con GET (list/retrieve) para catálogo de permisos
+class PermissionViewSet(ReadOnlyModelViewSet):
     queryset = Permission.objects.select_related("content_type").all() \
         .order_by("content_type__app_label","codename")
     serializer_class = PermissionBriefSerializer
-    http_method_names = ["get"]
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated, IsAdmin]
 
@@ -376,150 +333,6 @@ class InfraccionViewSet(viewsets.ModelViewSet):
         obj.save(update_fields=["estado", "is_active", "updated_at"])
         return Response(self.get_serializer(obj).data)
 
-# ====== TAREAS ======
-class TareaViewSet(viewsets.ModelViewSet):
-    """
-    CU15 / CU24:
-    - Admin/Staff ven todas y pueden crear/editar.
-    - Residentes solo ven: asignadas a ellos, creadas por ellos,
-      de su rol (si hay asignado_a_rol) o de sus unidades.
-    - Un asignado puede actualizar estado/descripcion y comentar.
-    """
-    authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
-    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
-    filterset_fields = ["estado", "prioridad", "asignado_a", "asignado_a_rol", "unidad", "is_active"]
-    search_fields = ["titulo", "descripcion", "unidad__torre", "unidad__bloque", "unidad__numero", "creado_por__username", "asignado_a__username"]
-    ordering_fields = ["updated_at", "created_at", "fecha_limite", "prioridad"]
-    ordering = ["-updated_at", "-created_at"]
-
-    def get_serializer_class(self):
-        # En create/update usa write; en list/retrieve devuelve full
-        if self.action in {"create", "update", "partial_update"}:
-            return TareaWriteSerializer
-        return TareaSerializer
-
-    def get_queryset(self):
-        u = self.request.user
-        qs = Tarea.objects.select_related("asignado_a", "asignado_a_rol", "creado_por", "unidad")
-        # Admin/staff ven todo
-        from .permissions import user_role_code
-        if getattr(u, "is_superuser", False) or user_role_code(u) in {"ADMIN", "STAFF"}:
-            return qs
-        # Residentes: sólo las relacionadas
-        mis_unidades = Unidad.objects.filter(Q(propietario=u) | Q(residente=u)).values_list("id", flat=True)
-        rol_id = getattr(getattr(getattr(u, "profile", None), "role", None), "id", None)
-        return qs.filter(
-            Q(creado_por=u) |
-            Q(asignado_a=u) |
-            Q(unidad_id__in=mis_unidades) |
-            Q(asignado_a_rol_id=rol_id)
-        ).distinct()
-
-    def perform_create(self, serializer):
-        u = self.request.user
-        is_admin = getattr(u, "is_superuser", False) or user_role_code(u) == "ADMIN"
-        can_manage = has_role_permission(u, "manage_tasks")
-        if not (is_admin or can_manage):
-            return Response({"detail": "No autorizado para crear tareas."}, status=403)
-
-        obj = serializer.save(creado_por=u)
-        if obj.asignado_a and obj.estado == "NUEVA":
-            obj.estado = "ASIGNADA"
-            obj.save(update_fields=["estado", "updated_at"])
-            
-
-
-    
-    def update(self, request, *args, **kwargs):
-        instancia = self.get_object()
-        u = request.user
-        is_admin = getattr(u, "is_superuser", False) or user_role_code(u) == "ADMIN"
-        can_manage = has_role_permission(u, "manage_tasks")
-        is_staff_manage = is_admin or can_manage
-
-        if not is_staff_manage and instancia.asignado_a_id != u.id:
-            return Response({"detail": "Solo el asignado puede actualizar la tarea."}, status=403)
-
-        partial = kwargs.pop('partial', False)
-        serializer = self.get_serializer(instancia, data=request.data, partial=partial)
-        serializer.is_valid(raise_exception=True)
-
-        if not is_staff_manage:
-            allowed = {"descripcion", "estado", "checklist"}
-            dirty = set(serializer.validated_data.keys()) - allowed
-            if dirty:
-                return Response({"detail": f"Como asignado, solo puedes modificar: {', '.join(sorted(allowed))}."}, status=403)
-
-        self.perform_update(serializer)
-        return Response(TareaSerializer(instancia).data)
-    
-    
-    # ---- Acciones de CU24 ----
-    @action(detail=True, methods=["post"])
-    def asignar(self, request, pk=None):
-        """Asignar a usuario o a rol (exclusivo). Solo admin/staff."""
-        from .permissions import user_role_code
-        if not (getattr(request.user, "is_superuser", False) or user_role_code(request.user) in {"ADMIN", "STAFF"}):
-            return Response({"detail": "No autorizado."}, status=403)
-        obj = self.get_object()
-        uid = request.data.get("user_id")
-        rol_id = request.data.get("rol_id")
-        if uid and rol_id:
-            return Response({"detail": "Indique solo user_id o rol_id."}, status=400)
-        obj.asignado_a_id = uid or None
-        obj.asignado_a_rol_id = rol_id or None
-        if uid and obj.estado == "NUEVA":
-            obj.estado = "ASIGNADA"
-        obj.save()
-        return Response(TareaSerializer(obj).data)
-
-    @action(detail=True, methods=["post"])
-    def tomar(self, request, pk=None):
-        """Un usuario puede 'tomar' una tarea de rol si su rol coincide."""
-        obj = self.get_object()
-        my_rol_id = getattr(getattr(getattr(request.user, "profile", None), "role", None), "id", None)
-        if not my_rol_id or obj.asignado_a_rol_id != my_rol_id:
-            return Response({"detail": "No puede tomar esta tarea."}, status=403)
-        obj.asignado_a = request.user
-        obj.asignado_a_rol = None
-        if obj.estado in {"NUEVA", "ASIGNADA"}:
-            obj.estado = "EN_PROGRESO"
-        obj.save()
-        return Response(TareaSerializer(obj).data)
-
-    @action(detail=True, methods=["post"])
-    def cambiar_estado(self, request, pk=None):
-        """Asignado o staff puede cambiar estado."""
-        obj = self.get_object()
-        nuevo = request.data.get("estado")
-        if nuevo not in dict(Tarea.ESTADO_CHOICES):
-            return Response({"detail": "Estado inválido."}, status=400)
-        u = request.user
-        from .permissions import user_role_code
-        is_staff = getattr(u, "is_superuser", False) or user_role_code(u) in {"ADMIN", "STAFF"}
-        if not is_staff and obj.asignado_a_id != u.id:
-            return Response({"detail": "No autorizado."}, status=403)
-        obj.estado = nuevo
-        obj.save(update_fields=["estado", "updated_at"])
-        return Response(TareaSerializer(obj).data)
-
-    @action(detail=True, methods=["post"])
-    def comentar(self, request, pk=None):
-        """Crea comentario en la tarea (cualquiera que pueda verla)."""
-        obj = self.get_object()
-        texto = (request.data.get("cuerpo") or "").strip()
-        if not texto:
-            return Response({"detail": "cuerpo requerido."}, status=400)
-        c = TareaComentario.objects.create(tarea=obj, autor=request.user, cuerpo=texto)
-        return Response(TareaComentarioSerializer(c).data, status=201)
-    def destroy(self, request, *args, **kwargs):
-        u = request.user
-        is_admin = getattr(u, "is_superuser", False) or user_role_code(u) == "ADMIN"
-        can_manage = has_role_permission(u, "manage_tasks")
-        if not (is_admin or can_manage):
-            return Response({"detail": "No autorizado para eliminar tareas."}, status=403)
-        return super().destroy(request, *args, **kwargs)
 
 class EstadoCuentaView(APIView):
     authentication_classes = [TokenAuthentication]
@@ -624,211 +437,91 @@ class EstadoCuentaExportCSV(APIView):
             writer.writerow([p.id, p.fecha_pago, p.monto, p.medio, p.referencia, getattr(p.cuota, "periodo", ""), getattr(p.cuota, "concepto", "")])
 
         return resp
-
-class AvisoViewSet(viewsets.ModelViewSet):
-    queryset = Aviso.objects.all()
-    serializer_class = AvisoSerializer
+#PAGO
+class OnlinePayInitView(APIView):
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
 
-    filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
-    filterset_fields = ["audiencia", "status", "torre", "is_active"]
-    search_fields = ["titulo", "cuerpo", "torre"]
-    ordering_fields = ["publish_at", "created_at", "updated_at"]
-    ordering = ["-publish_at", "-created_at"]
+    def post(self, request):
+        s = OnlinePayInitSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        cuota = s.validated_data["cuota"]
+        amount = s.validated_data["amount"]
 
-    def _is_admin(self, user):
-        return user.is_superuser or user_role_code(user) == "ADMIN"
-
-    def get_queryset(self):
-        qs = super().get_queryset().filter(is_active=True)
-        u = self.request.user
-        now = timezone.now()
-
-        if self._is_admin(u):
-            return qs
-
-        qs = qs.filter(status="PUBLICADO").filter(models.Q(publish_at__lte=now) | models.Q(publish_at__isnull=True))
-        qs = qs.exclude(expires_at__lt=now)
-
-        r_id = getattr(getattr(getattr(u, "profile", None), "role", None), "id", None)
-        unidades_user = Unidad.objects.filter(models.Q(propietario=u) | models.Q(residente=u))
-        cond_all = models.Q(audiencia="ALL")
-        cond_torre = models.Q(audiencia="TORRE", torre__in=list(unidades_user.values_list("torre", flat=True)))
-        cond_unidad = models.Q(audiencia="UNIDAD", unidades__in=list(unidades_user.values_list("id", flat=True)))
-        cond_rol = models.Q(audiencia="ROL", roles__in=[r_id] if r_id else [])
-        return qs.filter(cond_all | cond_torre | cond_unidad | cond_rol).distinct()
-
-    def create(self, request, *args, **kwargs):
-        if not self._is_admin(request.user):
-            return Response({"detail": "Solo administradores pueden crear avisos."}, status=403)
-        return super().create(request, *args, **kwargs)
-
-    def update(self, request, *args, **kwargs):
-        if not self._is_admin(request.user):
-            return Response({"detail": "Solo administradores pueden editar avisos."}, status=403)
-        return super().update(request, *args, **kwargs)
-
-    def destroy(self, request, *args, **kwargs):
-        if not self._is_admin(request.user):
-            return Response({"detail": "Solo administradores pueden eliminar avisos."}, status=403)
-        aviso = self.get_object()
-        aviso.is_active = False
-        aviso.save(update_fields=["is_active"])
-        return Response(status=204)
-
-    @action(detail=True, methods=["post"], url_path="publicar")
-    def publicar(self, request, pk=None):
-        if not self._is_admin(request.user):
-            return Response({"detail": "Solo administradores."}, status=403)
-        aviso = self.get_object()
-        aviso.publicar_ahora()
-        aviso.save(update_fields=["status", "publish_at", "updated_at"])
-        return Response(self.get_serializer(aviso).data)
-
-    @action(detail=True, methods=["post"], url_path="archivar")
-    def archivar(self, request, pk=None):
-        if not self._is_admin(request.user):
-            return Response({"detail": "Solo administradores."}, status=403)
-        aviso = self.get_object()
-        aviso.status = "ARCHIVADO"
-        aviso.save(update_fields=["status", "updated_at"])
-        return Response(self.get_serializer(aviso).data)
-    
-# ========= CU16: VIEWSET DE ÁREAS COMUNES =========
-from datetime import datetime, timedelta, time
-from django.utils import timezone
-from django.db.models import Q
-from rest_framework import viewsets
-from rest_framework.decorators import action
-from rest_framework.response import Response
-
-from .models import AreaComun, AreaDisponibilidad, ReservaArea
-from .serializers import AreaComunSerializer, DisponibilidadResponseSerializer
-# ya tienes:
-# from rest_framework.authentication import TokenAuthentication
-# from rest_framework.permissions import IsAuthenticated
-# from .permissions import IsAdmin
-
-class AreaComunViewSet(viewsets.ModelViewSet):
-    """
-    CRUD de áreas comunes (solo admins deberían crearlas/editar).
-    Acción GET disponibilidad: devuelve slots libres para una fecha.
-    """
-    queryset = AreaComun.objects.filter(activa=True)
-    serializer_class = AreaComunSerializer
-    authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]   # lectura; escritura restringida abajo
-
-    def get_permissions(self):
-        # list/retrieve/disponibilidad → autenticado
-        if self.action in {"list", "retrieve", "disponibilidad"}:
-            return [IsAuthenticated()]
-        # create/update/destroy → admin
-        return [IsAuthenticated(), IsAdmin()]
-
-    @action(detail=True, methods=["get"], url_path="disponibilidad")
-    def disponibilidad(self, request, pk=None):
-        """
-        GET /api/areas-comunes/{id}/disponibilidad/?date=YYYY-MM-DD&slot=60
-        Opcional: &from=HH:MM&to=HH:MM (sobrescribe ventanas configuradas)
-        """
-        area = self.get_object()
-
-        date_str = request.query_params.get("date")
-        if not date_str:
-            return Response({"detail": "Parámetro 'date' (YYYY-MM-DD) es requerido."}, status=400)
-        try:
-            target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-        except ValueError:
-            return Response({"detail": "Formato de 'date' inválido. Use YYYY-MM-DD."}, status=400)
-
-        try:
-            slot_minutes = int(request.query_params.get("slot", 60))
-        except Exception:
-            return Response({"detail": "Parámetro 'slot' inválido."}, status=400)
-
-        override_start = request.query_params.get("from")
-        override_end = request.query_params.get("to")
-
-        tz = timezone.get_current_timezone()
-        weekday = target_date.weekday()  # 0..6
-
-        # Ventanas: override o reglas de la BD
-        if override_start and override_end:
-            try:
-                s_h, s_m = map(int, override_start.split(":"))
-                e_h, e_m = map(int, override_end.split(":"))
-                windows = [(time(s_h, s_m), time(e_h, e_m))]
-            except Exception:
-                return Response({"detail": "Parámetros 'from'/'to' inválidos. Use HH:MM."}, status=400)
-        else:
-            reglas = list(AreaDisponibilidad.objects.filter(area=area, dia_semana=weekday).order_by("hora_inicio"))
-            if not reglas:
-                return Response({
-                    "area_id": area.id,
-                    "date": target_date,
-                    "slot_minutes": slot_minutes,
-                    "windows": [],
-                    "slots": []
-                })
-            windows = [(r.hora_inicio, r.hora_fin) for r in reglas]
-
-        # Reservas activas que solapan ese día
-        day_start = timezone.make_aware(datetime.combine(target_date, time(0, 0, 0)), tz)
-        day_end   = timezone.make_aware(datetime.combine(target_date, time(23, 59, 59)), tz)
-        activas = ["PENDIENTE", "CONFIRMADA", "PAGADA"]
-        reservas = list(
-            ReservaArea.objects.filter(area=area, estado__in=activas)
-            .filter(Q(fecha_inicio__lte=day_end) & Q(fecha_fin__gte=day_start))
-            .order_by("fecha_inicio")
+        # Crear PaymentIntent (USD en test)
+        intent = stripe.PaymentIntent.create(
+            amount=int(Decimal(amount) * 100),  # centavos
+            currency="usd",
+            metadata={"cuota_id": cuota.id, "user_id": request.user.id},
+            automatic_payment_methods={"enabled": True},
         )
 
-        # Unir reservas solapadas
-        busy = sorted([(r.fecha_inicio, r.fecha_fin) for r in reservas], key=lambda x: x[0])
-        merged = []
-        for b in busy:
-            if not merged or b[0] > merged[-1][1]:
-                merged.append([b[0], b[1]])
-            else:
-                merged[-1][1] = max(merged[-1][1], b[1])
-        busy = [(a, b) for a, b in merged]
+        op = OnlinePayment.objects.create(
+            cuota=cuota, amount=amount, currency="USD",
+            provider="STRIPE", provider_intent_id=intent["id"],
+            status=intent["status"].upper(), created_by=request.user,
+            metadata={"client_secret": intent["client_secret"]},
+        )
 
-        def to_dt(d, t):
-            return timezone.make_aware(datetime.combine(d, t), tz)
-
-        # Calcular intervalos libres por ventana
-        free_intervals = []
-        for w_start, w_end in windows:
-            w_s = to_dt(target_date, w_start)
-            w_e = to_dt(target_date, w_end)
-            cur = w_s
-            for b_s, b_e in busy:
-                if b_e <= cur or b_s >= w_e:
-                    continue
-                if b_s > cur:
-                    free_intervals.append((cur, min(b_s, w_e)))
-                cur = max(cur, b_e)
-                if cur >= w_e:
-                    break
-            if cur < w_e:
-                free_intervals.append((cur, w_e))
-
-        # Discretizar a slots de N minutos
-        slots = []
-        step = timedelta(minutes=slot_minutes)
-        for s, e in free_intervals:
-            cur = s
-            while cur + step <= e:
-                slots.append({"start": cur, "end": cur + step})
-                cur += step
-
-        data = {
-            "area_id": area.id,
-            "date": target_date,
-            "slot_minutes": slot_minutes,
-            "windows": [{"start": w[0], "end": w[1]} for w in windows],
-            "slots": slots
+        # Comprobante provisional inicial
+        provisional = {
+            "online_payment_id": op.id,
+            "provider": op.provider,
+            "intent_id": op.provider_intent_id,
+            "amount": str(op.amount),
+            "currency": op.currency,
+            "status": op.status,
         }
-        resp = DisponibilidadResponseSerializer(data)
-        return Response(resp.data)
+
+        return Response({"client_secret": intent["client_secret"], "provisional": provisional}, status=201)
+
+
+# ✅ Webhook Stripe sin auth, con AllowAny y method_decorator correcto
+@method_decorator(csrf_exempt, name="dispatch")
+class StripeWebhookView(APIView):
+    authentication_classes = []  # Stripe no envía token
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        payload = request.body
+        sig_header = request.META.get("HTTP_STRIPE_SIGNATURE")
+        endpoint_secret = settings.STRIPE_WEBHOOK_SECRET
+        try:
+            event = stripe.Webhook.construct_event(
+                payload=payload,
+                sig_header=sig_header,
+                secret=endpoint_secret
+            )
+        except Exception:
+            return HttpResponse(status=400)
+
+        if event["type"] in ("payment_intent.succeeded", "payment_intent.payment_failed", "payment_intent.canceled"):
+            pi = event["data"]["object"]
+            intent_id = pi["id"]
+            status_ = pi["status"].upper()
+
+            op = OnlinePayment.objects.filter(
+                provider_intent_id=intent_id
+            ).select_related("cuota", "created_by").first()
+            if not op:
+                return HttpResponse(status=200)
+
+            op.status = status_
+            meta = op.metadata or {}
+            meta.update({"last_event": event["type"]})
+            op.metadata = meta
+            op.save(update_fields=["status", "metadata", "updated_at"])
+
+            if status_ == "SUCCEEDED":
+                from decimal import Decimal as D
+                if not Pago.objects.filter(referencia=intent_id, medio="ONLINE_STRIPE").exists():
+                    pago = Pago.objects.create(
+                        cuota=op.cuota,
+                        monto=D(str(op.amount)),
+                        medio="ONLINE_STRIPE",
+                        referencia=intent_id,
+                        valido=True,
+                        creado_por=op.created_by,
+                    )
+                    pago.aplicar()
+        return HttpResponse(status=200)
