@@ -2,6 +2,8 @@ import { useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { login, me, getRole } from "../api/auth";
 import "./Signin.css";
+import logo from "../assets/logo.svg";
+
 
 export default function Signin() {
   const [username, setUsername] = useState("");
@@ -38,6 +40,7 @@ export default function Signin() {
   return (
     <div className="signin">
       <form className="signin__card" onSubmit={handleSubmit} noValidate>
+        <img src={logo} alt="Logo" className="signin__logo" />
         <h2 className="signin__title">Iniciar Sesión</h2>
         <p className="signin__subtitle">
           Bienvenido a un Condominio Inteligente

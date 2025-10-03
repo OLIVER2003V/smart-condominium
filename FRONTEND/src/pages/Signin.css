@@ -142,3 +142,10 @@
   animation: signin-spin .7s linear infinite;
 }
 @keyframes signin-spin { to { transform: rotate(360deg); } }
+
+.signin__logo {
+  width: 220px;      /* tamaño del logo */
+  height: auto;      /* mantiene proporción */
+  margin: 0 auto -50px;
+  display: block;    /* centra el logo */
+}

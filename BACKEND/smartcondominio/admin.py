@@ -6,7 +6,7 @@ from .models import (
     Tarea, TareaComentario,
     AreaComun, AreaDisponibilidad, ReservaArea,
     Visitor, Visit,
-    Vehiculo, SolicitudVehiculo,
+    Vehiculo, SolicitudVehiculo, AccessEvent
 )
 
 # --- Profile ---
@@ -103,3 +103,9 @@ class SolicitudVehiculoAdmin(admin.ModelAdmin):
     list_display = ("placa", "solicitante", "estado", "unidad", "created_at", "revisado_en")
     list_filter = ("estado", "unidad", "tipo")
     search_fields = ("placa", "solicitante__username", "solicitante__first_name", "solicitante__last_name")
+    
+@admin.register(AccessEvent)
+class AccessEventAdmin(admin.ModelAdmin):
+    list_display = ("created_at", "camera_id", "plate_norm", "score", "decision", "opened")
+    search_fields = ("plate_norm", "plate_raw", "reason")
+    list_filter = ("decision", "opened", "camera_id")

@@ -16,7 +16,7 @@ from .models import (
     Tarea, TareaComentario,
     Vehiculo, SolicitudVehiculo,
     Aviso,
-    MockReceipt, OnlinePaymentIntent,
+    MockReceipt, OnlinePaymentIntent, AccessEvent
 )
 
 User = get_user_model()
@@ -726,17 +726,28 @@ class StaffKindSerializer(serializers.ModelSerializer):
         read_only_fields = ["id"]
 
 
-# ------------------------------ Visitantes / Visitas ------------------------------
+# ========= Visitor =========
 class VisitorSerializer(serializers.ModelSerializer):
     class Meta:
         model = Visitor
         fields = ["id", "full_name", "doc_type", "doc_number", "phone"]
 
 
+# ========= Visit (LECTURA) =========
+# Versión para listar/detallar: expone campos de aprobación en solo-lectura.
 class VisitSerializer(serializers.ModelSerializer):
-    visitor = VisitorSerializer()
+    visitor = VisitorSerializer(read_only=True)
     host_resident_name = serializers.SerializerMethodField(read_only=True)
     unit_name = serializers.SerializerMethodField(read_only=True)
+
+    # --- aprobación (solo lectura aquí) ---
+    approval_status = serializers.CharField(read_only=True)
+    approval_expires_at = serializers.DateTimeField(read_only=True)
+    approved_at = serializers.DateTimeField(read_only=True)
+    approved_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    denied_at = serializers.DateTimeField(read_only=True)
+    denied_by = serializers.PrimaryKeyRelatedField(read_only=True)
+    approval_token = serializers.UUIDField(read_only=True)  # útil si vas a enviar link
 
     class Meta:
         model = Visit
@@ -748,9 +759,19 @@ class VisitSerializer(serializers.ModelSerializer):
             "unit_name", "host_resident_name",
             "vehicle_plate", "purpose", "scheduled_for",
             "status", "entry_at", "exit_at", "notes",
+            # --- aprobación ---
+            "approval_status", "approval_expires_at",
+            "approved_at", "approved_by", "denied_at", "denied_by",
+            "approval_token",
+            # auditoría
             "created_at", "created_by", "updated_at", "updated_by", "entry_by", "exit_by",
         ]
-        read_only_fields = ["status", "entry_at", "exit_at", "created_by", "updated_by", "entry_by", "exit_by"]
+        read_only_fields = [
+            "status", "entry_at", "exit_at",
+            "created_at", "created_by", "updated_at", "updated_by", "entry_by", "exit_by",
+            "approval_status", "approval_expires_at",
+            "approved_at", "approved_by", "denied_at", "denied_by", "approval_token",
+        ]
 
     def get_host_resident_name(self, obj):
         u = obj.host_resident
@@ -763,6 +784,33 @@ class VisitSerializer(serializers.ModelSerializer):
         b = f"-{u.lote}" if u.lote else ""
         return f"Mza {u.manzana}{b}-{u.numero}"
 
+
+# ========= Visit (CREAR/EDITAR) =========
+# Acepta visitante anidado para crear/actualizar.
+class VisitWriteSerializer(serializers.ModelSerializer):
+    visitor = VisitorSerializer()
+
+    class Meta:
+        model = Visit
+        fields = [
+            "id",
+            "visitor",
+            "unit",
+            "host_resident",
+            "vehicle_plate",
+            "purpose",
+            "scheduled_for",
+            "notes",
+        ]
+
+    # Validaciones pequeñas útiles
+    def validate_scheduled_for(self, value):
+        from django.utils import timezone
+        if value and value < timezone.now() - timezone.timedelta(minutes=1):
+            raise serializers.ValidationError("La fecha/hora programada no puede estar en el pasado.")
+        return value
+
+    # -------- helpers internos --------
     def _get_or_create_visitor(self, validated):
         vdata = validated.pop("visitor")
         visitor, _ = Visitor.objects.get_or_create(
@@ -775,13 +823,16 @@ class VisitSerializer(serializers.ModelSerializer):
         )
         changed = False
         if vdata.get("full_name") and visitor.full_name != vdata["full_name"].strip():
-            visitor.full_name = vdata["full_name"].strip(); changed = True
+            visitor.full_name = vdata["full_name"].strip()
+            changed = True
         if "phone" in vdata and (visitor.phone or "") != (vdata.get("phone") or "").strip():
-            visitor.phone = (vdata.get("phone") or "").strip(); changed = True
+            visitor.phone = (vdata.get("phone") or "").strip()
+            changed = True
         if changed:
             visitor.save()
         return visitor
 
+    # -------- create/update --------
     def create(self, validated):
         request = self.context.get("request")
         user = getattr(request, "user", None)
@@ -801,6 +852,20 @@ class VisitSerializer(serializers.ModelSerializer):
         instance.save()
         return instance
 
+
+# ========= Serializers pequeños para acciones =========
+# Útiles si vas a tener endpoints /approve, /deny, /checkin, /checkout
+class VisitApproveSerializer(serializers.Serializer):
+    hours_valid = serializers.IntegerField(required=False, min_value=1, max_value=168)  # 1h–7d
+
+class VisitDenySerializer(serializers.Serializer):
+    reason = serializers.CharField(required=False, allow_blank=True)
+
+class VisitCheckInSerializer(serializers.Serializer):
+    force = serializers.BooleanField(required=False, default=False)
+
+class VisitCheckOutSerializer(serializers.Serializer):
+    pass
 
 # ------------------------------ Vehículos / Solicitudes ------------------------------
 class VehiculoSerializer(serializers.ModelSerializer):
@@ -904,3 +969,30 @@ class MockReceiptSerializer(serializers.ModelSerializer):
         if not attrs.get("receipt_url") and not attrs.get("reference"):
             raise serializers.ValidationError({"receipt_url": "Debes informar receipt_url o reference."})
         return attrs
+
+
+#ia
+class SnapshotInSerializer(serializers.Serializer):
+    gate_id = serializers.IntegerField(required=False)  # opcional si aún no tienes Gate
+    camera_id = serializers.CharField(required=False, allow_blank=True)
+    image = serializers.ImageField(required=True)
+    
+class AccessEventSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AccessEvent
+        fields = [
+            "id",
+            "created_at",
+            "camera_id",
+            "plate_raw",
+            "plate_norm",
+            "score",
+            "decision",
+            "reason",
+            "opened",
+            "vehicle",
+            "visit",
+            "payload",
+            "triggered_by",
+        ]
+        read_only_fields = ["id", "created_at"]

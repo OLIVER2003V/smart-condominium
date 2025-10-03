@@ -13,8 +13,9 @@ import {
   denyVisit,
   serializeVisitPayload,
   buildVisitQuery,
+  approvalBadgeClass, // 👈 nuevo helper
 } from "../api/visits";
-import "./VisitsPage.css"; // 👈 CSS específico para Visitas
+import "./VisitsPage.css";
 
 const STATUS_CHOICES = [
   { value: "", label: "(todas)" },
@@ -43,8 +44,11 @@ const FORM_INIT = {
 function asISOorNull(v) {
   const s = String(v || "").trim();
   if (!s) return null;
-  // soporta "YYYY-MM-DDTHH:mm" del input datetime-local
-  return s.length === 16 ? s + ":00" : s;
+  // "YYYY-MM-DDTHH:mm" -> "YYYY-MM-DDTHH:mm:00Z"
+  if (s.length === 16) return s + ":00Z";
+  // "YYYY-MM-DDTHH:mm:ss" -> "YYYY-MM-DDTHH:mm:ssZ"
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(s)) return s + "Z";
+  return s;
 }
 
 function badgeClass(status) {
@@ -98,7 +102,6 @@ export default function VisitsPage() {
     }
   };
 
-  // primera carga
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -239,6 +242,7 @@ export default function VisitsPage() {
 
     try {
       setSubmitting(true);
+      console.log("VISIT PAYLOAD →", payload);
       if (editingId) {
         await updateVisit(editingId, payload);
       } else {
@@ -249,12 +253,22 @@ export default function VisitsPage() {
       setEditingId(null);
       await load();
     } catch (err) {
-      console.error(err);
-      const msg =
-        err?.response?.data?.visitor?.non_field_errors?.[0] ??
-        err?.response?.data?.detail ??
-        "No se pudo guardar la visita.";
-      setFormError(msg);
+      console.error("CREATE/UPDATE VISIT ERROR →", err?.response?.data || err);
+     const data = err?.response?.data;
+     let msg = "No se pudo guardar la visita.";
+     if (typeof data === "string") {
+       msg = data;
+     } else if (data) {
+       // junta todos los errores campo: mensaje
+       const parts = [];
+       Object.entries(data).forEach(([k, v]) => {
+         if (Array.isArray(v)) parts.push(`${k}: ${v.join(", ")}`);
+         else if (typeof v === "string") parts.push(`${k}: ${v}`);
+         else parts.push(`${k}: ${JSON.stringify(v)}`);
+       });
+       if (parts.length) msg = parts.join(" | ");
+     }
+     setFormError(msg);
     } finally {
       setSubmitting(false);
     }
@@ -272,9 +286,9 @@ export default function VisitsPage() {
     }
   };
 
-  // acciones estado
-  const doEnter = async (id) => {
-    await enterVisit(id);
+  // acciones estado (portería)
+  const doEnter = async (id, { force = false } = {}) => {
+    await enterVisit(id, { force });
     await load();
   };
   const doExit = async (id) => {
@@ -567,6 +581,7 @@ export default function VisitsPage() {
               <th className="col--md">Anfitrión</th>
               <th className="col--sm">Placa</th>
               <th className="col--md">Propósito</th>
+              <th className="col--sm">Aprobación</th> {/* 👈 nueva */}
               <th className="col--sm">Estado</th>
               <th className="col--md">Entrada</th>
               <th className="col--md">Salida</th>
@@ -576,12 +591,12 @@ export default function VisitsPage() {
           <tbody>
             {loading && (
               <tr>
-                <td colSpan={10}>Cargando…</td>
+                <td colSpan={11}>Cargando…</td>
               </tr>
             )}
             {!loading && (rows?.length ?? 0) === 0 && (
               <tr>
-                <td colSpan={10}>Sin resultados.</td>
+                <td colSpan={11}>Sin resultados.</td>
               </tr>
             )}
             {(rows ?? []).map((v) => (
@@ -599,11 +614,26 @@ export default function VisitsPage() {
                 <td>{v.host_resident_name || v.host_resident}</td>
                 <td>{v.vehicle_plate || "—"}</td>
                 <td>{v.purpose || "—"}</td>
+
+                {/* Aprobación */}
+                <td>
+                  <span className={`badge ${approvalBadgeClass(v.approval_status)}`}>
+                    {v.approval_status || "—"}
+                  </span>
+                  {v.approval_expires_at && (
+                    <div className="subtle">
+                      Expira: {new Date(v.approval_expires_at).toLocaleString()}
+                    </div>
+                  )}
+                </td>
+
+                {/* Estado operativo */}
                 <td>
                   <span className={`badge ${badgeClass(v.status)}`}>{v.status}</span>
                 </td>
                 <td>{v.entry_at ? new Date(v.entry_at).toLocaleString() : "—"}</td>
                 <td>{v.exit_at ? new Date(v.exit_at).toLocaleString() : "—"}</td>
+
                 <td className="au-actions">
                   <button
                     className="au-button au-button--ghost"
@@ -627,9 +657,21 @@ export default function VisitsPage() {
                         className="au-button au-button--ghost"
                         onClick={() => doEnter(v.id)}
                         title="Marcar entrada"
+                        disabled={v.approval_status !== "APR"} // 👈 bloquea si no aprobado
                       >
                         Ingresar
                       </button>
+
+                      {v.approval_status !== "APR" && (
+                        <button
+                          className="au-button au-button--ghost"
+                          onClick={() => doEnter(v.id, { force: true })}
+                          title="Forzar ingreso (sin aprobación válida)"
+                        >
+                          Ingresar (forzar)
+                        </button>
+                      )}
+
                       <button
                         className="au-button au-button--ghost"
                         onClick={() => doDeny(v.id)}
@@ -646,6 +688,7 @@ export default function VisitsPage() {
                       </button>
                     </>
                   )}
+
                   {v.status === "INGRESADO" && (
                     <button
                       className="au-button au-button--ghost"

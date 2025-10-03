@@ -1,6 +1,6 @@
 from decimal import Decimal
 from datetime import date
-
+import uuid
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission, User  # User para FKs directas en algunos modelos
@@ -594,10 +594,16 @@ class Visitor(models.Model):
 class Visit(models.Model):
     STATUS = [
         ("REGISTRADO", "Registrado"),
-        ("INGRESADO", "Ingresado"),
-        ("SALIDO", "Salido"),
-        ("CANCELADO", "Cancelado"),
-        ("DENEGADO", "Denegado"),
+        ("INGRESADO",  "Ingresado"),
+        ("SALIDO",     "Salido"),
+        ("CANCELADO",  "Cancelado"),
+        ("DENEGADO",   "Denegado"),
+    ]
+    APPROVAL = [
+        ("PEND", "Pendiente"),
+        ("APR",  "Aprobada"),
+        ("DEN",  "Denegada"),
+        ("EXP",  "Expirada"),
     ]
 
     visitor = models.ForeignKey(Visitor, on_delete=models.PROTECT, related_name="visits")
@@ -617,6 +623,23 @@ class Visit(models.Model):
     entry_at = models.DateTimeField(null=True, blank=True)
     exit_at = models.DateTimeField(null=True, blank=True)
 
+    # --- aprobación del residente ---
+    approval_status     = models.CharField(max_length=4, choices=APPROVAL, default="PEND", db_index=True)
+    # para evitar líos con SQLite, sin unique por ahora (solo index):
+    approval_token      = models.UUIDField(default=uuid.uuid4, editable=False, db_index=True)
+    approval_expires_at = models.DateTimeField(null=True, blank=True)
+    approved_at         = models.DateTimeField(null=True, blank=True)
+    approved_by         = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="visits_approved"
+    )
+    denied_at           = models.DateTimeField(null=True, blank=True)
+    denied_by           = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="visits_denied"
+    )
+    # -------------------------------
+
     notes = models.TextField(blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -629,13 +652,33 @@ class Visit(models.Model):
     class Meta:
         indexes = [
             models.Index(fields=["status"]),
+            models.Index(fields=["approval_status"]),
             models.Index(fields=["vehicle_plate"]),
             models.Index(fields=["created_at"]),
         ]
         ordering = ["-created_at"]
 
+    # helpers (opcionales)
+    def is_approval_valid(self):
+        if self.approval_status != "APR":
+            return False
+        if self.approval_expires_at and timezone.now() > self.approval_expires_at:
+            return False
+        return True
+
+    def approve(self, by_user, hours_valid=24):
+        self.approval_status = "APR"
+        self.approved_at = timezone.now()
+        self.approved_by = by_user
+        if not self.approval_expires_at:
+            self.approval_expires_at = timezone.now() + timezone.timedelta(hours=hours_valid)
+
+    def deny(self, by_user):
+        self.approval_status = "DEN"
+        self.denied_at = timezone.now()
+        self.denied_by = by_user
+
     def save(self, *args, **kwargs):
-        # Normalización de placa
         if self.vehicle_plate:
             self.vehicle_plate = self.vehicle_plate.strip().upper().replace(" ", "")
         super().save(*args, **kwargs)
@@ -647,7 +690,9 @@ class Visit(models.Model):
         if self.exit_at and self.entry_at and self.exit_at < self.entry_at:
             raise ValidationError("La hora de salida no puede ser anterior a la hora de entrada.")
 
-    def mark_entry(self, user):
+    def mark_entry(self, user, *, force: bool = False):
+        if not force and not self.is_approval_valid():
+            raise ValueError("La visita no está aprobada o la aprobación venció.")
         self.entry_at = timezone.now()
         self.entry_by = user
         self.status = "INGRESADO"
@@ -871,3 +916,23 @@ class MockReceipt(models.Model):
         from django.core.exceptions import ValidationError
         if self.amount is not None and self.amount <= Decimal("0"):
             raise ValidationError({"amount": "El monto (si se informa) debe ser > 0."})
+#IA BITACORA DE INGRESO
+# --- Accesos vehiculares (bitácora) ---
+class AccessEvent(models.Model):
+    created_at   = models.DateTimeField(auto_now_add=True)
+    camera_id    = models.CharField(max_length=60, blank=True)
+    plate_raw    = models.CharField(max_length=30, blank=True)
+    plate_norm   = models.CharField(max_length=30, db_index=True, blank=True)
+    score        = models.FloatField(null=True, blank=True)
+    decision     = models.CharField(max_length=32)   # ALLOW_RESIDENT | ALLOW_VISIT | DENY_UNKNOWN | ERROR_OCR
+    reason       = models.CharField(max_length=200, blank=True)
+    opened       = models.BooleanField(default=False)
+
+    vehicle      = models.ForeignKey("smartcondominio.Vehiculo", null=True, blank=True, on_delete=models.SET_NULL)
+    visit        = models.ForeignKey("smartcondominio.Visit",    null=True, blank=True, on_delete=models.SET_NULL)
+
+    payload      = models.JSONField(default=dict, blank=True)   # respuesta completa de Plate Recognizer (opcional)
+    triggered_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL)
+
+    class Meta:
+        ordering = ["-created_at"]

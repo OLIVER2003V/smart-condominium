@@ -1,29 +1,30 @@
 import axios from "axios";
 
-const RAW_BASE = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000/api/";
+const RAW_BASE =
+  import.meta.env.VITE_API_BASE ||
+  import.meta.env.VITE_API_URL ||
+  "http://127.0.0.1:8000/api/";
 // Normaliza: garantiza que termine en '/'
 const BASE = RAW_BASE.endsWith("/") ? RAW_BASE : RAW_BASE + "/";
 
-const LOGIN_PATH = import.meta.env.VITE_API_LOGIN_PATH || "auth/login/";
-const ME_PATH = import.meta.env.VITE_API_ME_PATH || "auth/me/";
-const ME_UPDATE_PATH =
-  import.meta.env.VITE_API_UPDATE_PATH || "auth/me/update/";
+const LOGIN_PATH = (import.meta.env.VITE_API_LOGIN_PATH || "auth/login/").replace(/^\/+/, "");
+const ME_PATH = (import.meta.env.VITE_API_ME_PATH || "auth/me/").replace(/^\/+/, "");
+const ME_UPDATE_PATH = (import.meta.env.VITE_API_UPDATE_PATH || "auth/me/update/").replace(/^\/+/, "");
 const CHANGE_PASSWORD = "auth/change-password/";
 
 //CLIENTE AXIOS
 export const api = axios.create({
-  baseURL: BASE, // BASE ya normalizado con trailing slash
+  baseURL: BASE,
   headers: { Accept: "application/json", "Content-Type": "application/json" },
+  timeout: 15000,
 });
 
 //FUNCION TOKEN
 export function setAuthToken(token) {
   if (token) {
-    //SI HAY TOKEN
-    localStorage.setItem("token", token); //GUARDA EN LOCALSTORAGE
-    api.defaults.headers.common.Authorization = `Token ${token}`; // DRF TokenAuth LO AGREGA AL HEADER AUTHORIZATION
+    localStorage.setItem("token", token);
+    api.defaults.headers.common.Authorization = `Token ${token}`;
   } else {
-    //SI NO HAY TOKEN LOS REMUEVE DE LOCAL Y HEADER
     localStorage.removeItem("token");
     delete api.defaults.headers.common.Authorization;
   }
@@ -33,17 +34,16 @@ export function setAuthToken(token) {
 const saved = localStorage.getItem("token");
 if (saved) setAuthToken(saved);
 
-// 🔎 logea cada request para verificar la URL final
+// 🔎 logea cada request para verificar la URL final (solo en dev)
 api.interceptors.request.use((cfg) => {
-  const full = new URL(
-    cfg.url ?? "",
-    cfg.baseURL ?? window.location.origin
-  ).toString();
-  console.log("[REQUEST]", full, cfg.params);
+  if (import.meta.env.DEV) {
+    const full = new URL(cfg.url ?? "", cfg.baseURL ?? window.location.origin).toString();
+    console.log("[REQUEST]", cfg.method?.toUpperCase(), full, cfg.params || "");
+  }
   return cfg;
 });
-// Limpieza automática si el backend responde 401
 
+// Limpieza automática si el backend responde 401
 api.interceptors.response.use(
   (r) => r,
   (error) => {
@@ -55,30 +55,92 @@ api.interceptors.response.use(
   }
 );
 
-//POST MANDA CREDENCIALES AL ENDPOINT
-export async function login(username, password) {
-  const { data } = await api.post(LOGIN_PATH, { username, password });
-  const token =
-    data?.token || data?.key || data?.values?.token || data?.values?.key;
-  //SI NO HAY TOKEN
-  if (!token) throw new Error("No se recibió token desde el backend");
-  //SI HAY LO GUARDA Y CONFIGURA EL HEADER
-  setAuthToken(token);
-  return { token };
+// --- util: traducir errores de DRF a mensajes amigables
+export function friendlyLoginError(err) {
+  const data = err?.response?.data || {};
+
+  if (data.username?.length) return "El usuario es obligatorio.";
+  if (data.password?.length) return "La contraseña es obligatoria.";
+  if (Array.isArray(data.non_field_errors) && data.non_field_errors[0]) {
+    return "Usuario o contraseña incorrectos.";
+  }
+  if (typeof data.detail === "string" && data.detail) {
+    if (data.detail.toLowerCase().includes("no active")) {
+      return "Tu cuenta está inactiva. Contacta al administrador.";
+    }
+    if (data.detail.toLowerCase().includes("invalid")) {
+      return "Datos inválidos. Revisa usuario y contraseña.";
+    }
+    return data.detail;
+  }
+
+  const s = err?.response?.status;
+  if (s === 400) return "Datos inválidos. Revisa usuario y contraseña.";
+  if (s === 401) return "No autorizado. Verifica tus credenciales.";
+  if (s === 403) return "No tienes permisos para realizar esta acción.";
+  if (s === 500) return "Error del servidor. Intenta de nuevo más tarde.";
+
+  return "Error al iniciar sesión. Inténtalo de nuevo.";
 }
 
-//GET LLAMA AL ENDPOINT Y DEVUELVE EL USUARIO SOLO SI EL HEADER, AUTHORIZATION YA FUE SETEADO
+//POST MANDA CREDENCIALES AL ENDPOINT
+export async function login(username, password) {
+  try {
+    const { data, status } = await api.post(LOGIN_PATH, {
+      username: (username || "").trim(),
+      password: password || "",
+    });
+
+    const token =
+      data?.token ||
+      data?.key ||
+      data?.access ||
+      data?.access_token ||
+      data?.values?.token ||
+      data?.values?.key;
+
+    if (!token) {
+      if (import.meta.env.DEV) console.warn("[LOGIN NO TOKEN]", { status, data });
+      const serverMsg =
+        data?.detail || data?.message || data?.error || "No se recibió token desde el backend";
+      throw new Error(serverMsg);
+    }
+
+    setAuthToken(token);
+    return { token };
+  } catch (err) {
+    if (import.meta.env.DEV) {
+      if (axios.isAxiosError?.(err)) {
+        console.warn("[LOGIN AXIOS ERROR]", {
+          status: err.response?.status,
+          body: err.response?.data,
+          url: (err.config?.baseURL || "") + (err.config?.url || ""),
+          method: err.config?.method,
+          code: err.code,
+          message: err.message,
+        });
+      } else {
+        console.warn("[LOGIN GENERIC ERROR]", { name: err?.name, message: err?.message });
+      }
+    }
+    const friendly = friendlyLoginError(err);
+    const e = new Error(friendly);
+    e.original = err;
+    throw e;
+  }
+}
+
+//GET LLAMA AL ENDPOINT Y DEVUELVE EL USUARIO SOLO SI EL HEADER AUTHORIZATION YA FUE SETEADO
 export async function me() {
   const { data } = await api.get(ME_PATH);
-  return data; // { id, username, role/rol/rolNombre, ... }
+  return data;
 }
-//METODO PARA ACTUALIZAR EL PERFIL
+
 export async function updateMe(payload) {
   const { data } = await api.patch(ME_UPDATE_PATH, payload);
   return data;
 }
 
-//METODO PARA ACTUALIZAR LA CONTRASEÑA DEL PERFIL
 export async function changePassword({ current_password, new_password }) {
   const { data } = await api.post(CHANGE_PASSWORD, {
     current_password,
@@ -124,31 +186,22 @@ export function getRole(obj) {
 //API DE USUARIOS
 const USERS_BASE = import.meta.env.VITE_API_USERS_PATH ?? "admin/users/";
 
-// Normaliza el payload: quita vacíos y no envía password si no se cambió
 function cleanUserPayload(input, isCreate = false) {
   const p = { ...input };
-
-  // strings vacíos -> fuera
   for (const k of ["email", "first_name", "last_name"]) {
     if (!p[k]) delete p[k];
   }
-
-  // si no quieres cambiar contraseña en edición, no la mandes
   if (!isCreate && !p.password) delete p.password;
-
-  // rol esperado como string: "ADMIN" | "PERSONAL" | "RESIDENTE"
   if (typeof p.role === "string" && p.role.trim()) {
     const out = p.role.trim().toUpperCase();
     const mapOut = { PERSONAL: "STAFF", RESIDENTE: "RESIDENT" };
-    p.role_input = mapOut[out] || out; // ADMIN se mantiene
+    p.role_input = mapOut[out] || out;
     delete p.role;
   }
-
   return p;
 }
 
 export async function listUsers(params = {}) {
-  // soporta paginado DRF (results) o lista directa
   const { data } = await api.get(USERS_BASE, { params });
   return Array.isArray(data) ? data : data.results || data;
 }

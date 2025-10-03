@@ -1,58 +1,54 @@
-# views_api.py
-from rest_framework import status, permissions, viewsets, filters, serializers, mixins
-from rest_framework import generics
+from django.contrib.auth import get_user_model
+from django.shortcuts import get_object_or_404
 from rest_framework.views import APIView
-
+from django.db import IntegrityError
+from django.db.models import Q, Sum, F, DecimalField, ExpressionWrapper
+from django.db.models.deletion import ProtectedError, RestrictedError
+from rest_framework import status, permissions, viewsets, filters, serializers
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.decorators import api_view, permission_classes, authentication_classes, action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from django.http import HttpResponse
+import csv
+from django.contrib.auth.models import Permission
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
-
-from django.db import IntegrityError, models, transaction
-from django.db.models import Q, Sum, F, DecimalField, ExpressionWrapper
-from django.db.models.deletion import ProtectedError, RestrictedError
-from django.utils import timezone
-from django.http import HttpResponse
-from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Permission
-from datetime import date, datetime, timedelta, time
-import csv, uuid, io
-
-from .models import (
-    Rol, Profile, Unidad, Cuota, Pago, Infraccion,
-    Visitor, Visit, Aviso,
-    Tarea, TareaComentario,
-    AreaComun, AreaDisponibilidad, ReservaArea,
-    Vehiculo, SolicitudVehiculo,
-    OnlinePaymentIntent, MockReceipt,
-)
-
-from .permissions import (
-    IsAdmin, IsStaff, IsStaffGuardOrAdmin,
-    IsAdminOrStaff, IsOwnerOrAdmin,
-    VisitAccess, user_role_code, has_role_permission
-)
-
+from datetime import date
+from .models import Rol, Profile, Unidad, Cuota, Pago, Infraccion, Visitor, Visit, OnlinePaymentIntent, MockReceipt, Vehiculo, SolicitudVehiculo
+from .permissions import IsAdmin
+from .permissions import user_role_code, has_role_permission, IsStaffGuardOrAdmin
 from .serializers import (
-    RegisterSerializer, MeSerializer, AdminUserSerializer, MeUpdateSerializer, ChangePasswordSerializer,
-    RolSimpleSerializer, PermissionBriefSerializer,
-    UnidadSerializer, CuotaSerializer, PagoCreateSerializer, PagoSerializer, GenerarCuotasSerializer,
-    InfraccionSerializer, PagoEstadoCuentaSerializer, UnidadBriefECSerializer,
-    TareaSerializer, TareaWriteSerializer, TareaComentarioSerializer,
-    VisitorSerializer, VisitSerializer,
-    AreaComunSerializer, DisponibilidadResponseSerializer,              # 👈 AQUI ESTÁN
-    VehiculoSerializer, SolicitudVehiculoCreateSerializer,
-    SolicitudVehiculoListSerializer, SolicitudVehiculoReviewSerializer,
-    OnlinePaymentIntentSerializer, MockReceiptSerializer,
-    AvisoSerializer
+    RegisterSerializer,
+    MeSerializer,
+    AdminUserSerializer,
+    MeUpdateSerializer,
+    ChangePasswordSerializer,
+    RolSimpleSerializer,
+    PermissionBriefSerializer, UnidadSerializer, CuotaSerializer, PagoCreateSerializer, PagoSerializer,GenerarCuotasSerializer, InfraccionSerializer,PagoEstadoCuentaSerializer,UnidadBriefECSerializer, VisitorSerializer, VisitSerializer, OnlinePaymentIntentSerializer, MockReceiptSerializer, VehiculoSerializer, SolicitudVehiculo, VisitWriteSerializer,
+    VisitApproveSerializer,
+    VisitDenySerializer,
+    VisitCheckInSerializer,
+    VisitCheckOutSerializer,   # 👈 lo importamos (definido en serializers.py)
 )
-
+from .models import Aviso, Unidad
+from .serializers import AvisoSerializer
+from .permissions import IsAdmin, user_role_code, VisitAccess, IsStaff
+from django.utils import timezone
+from django.db import models
+from django.conf import settings
+from .models import Tarea, TareaComentario, OnlinePaymentIntent, MockReceipt  # + ya tienes Unidad, etc.
+from .serializers import (
+    # ... lo que ya tienes ...
+    TareaSerializer, TareaWriteSerializer, TareaComentarioSerializer,
+)
+from .permissions import IsAdmin, IsStaff
+import uuid, io
 User = get_user_model()
 
-# ===================== AUTH / PROFILE =====================
-
+# 👤 Registrar usuario
+# 👤 Registrar usuario
+from rest_framework import generics
 class RegisterView(generics.CreateAPIView):
     serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
@@ -72,6 +68,82 @@ class RegisterView(generics.CreateAPIView):
             status=status.HTTP_201_CREATED,
         )
 
+class IsResidentHost(IsAuthenticated):
+    """
+    Permite sólo al residente/anfitrión de la visita operar (aprobar/denegar).
+    """
+    def has_object_permission(self, request, view, obj):
+        return super().has_permission(request, view) and obj.host_resident_id == request.user.id
+# 👥 Admin de usuarios
+# --- REEMPLAZO COMPLETO DE AdminUserViewSet ---
+class AdminUserViewSet(viewsets.ModelViewSet):
+    queryset = User.objects.select_related("profile__role").all().order_by("id")
+    serializer_class = AdminUserSerializer
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated, IsAdmin]
+
+    # búsquedas / orden / filtros
+    from django_filters.rest_framework import DjangoFilterBackend
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ["username", "first_name", "last_name", "email", "profile__role__code", "profile__role__name"]
+    ordering_fields = ["id", "username", "email", "first_name", "last_name", "is_active"]
+    filterset_fields = ["is_active", "is_superuser", "profile__role__code"]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        group = self.request.query_params.get("group")
+        if group == "residents":
+            qs = qs.filter(profile__role__base="RESIDENT")
+        elif group == "staff":
+            qs = qs.filter(profile__role__base="STAFF").exclude(is_superuser=True)
+        return qs
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if instance.pk == request.user.pk:
+            return Response({"detail": "No puedes eliminar tu propia cuenta."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        if getattr(instance, "is_superuser", False) and not getattr(request.user, "is_superuser", False):
+            return Response({"detail": "Solo un superusuario puede eliminar a otro superusuario."},
+                            status=status.HTTP_403_FORBIDDEN)
+
+        if getattr(instance, "is_superuser", False) and not User.objects.filter(
+            is_superuser=True, is_active=True
+        ).exclude(pk=instance.pk).exists():
+            return Response({"detail": "No se puede eliminar el último superusuario activo."},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            self.perform_destroy(instance)
+        except (ProtectedError, RestrictedError):
+            return Response({"detail": "No se puede eliminar: tiene registros relacionados (integridad referencial)."},
+                            status=status.HTTP_409_CONFLICT)
+        except IntegrityError as e:
+            return Response({"detail": "No se puede eliminar por integridad referencial.", "error": str(e)},
+                            status=status.HTTP_409_CONFLICT)
+        except Exception as e:
+            return Response({"detail": "Error inesperado al eliminar.", "error": str(e)},
+                            status=status.HTTP_400_BAD_REQUEST)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # listas rápidas
+    @action(detail=False, methods=["get"], url_path="residents")
+    def residents(self, request):
+        qs = self.filter_queryset(self.get_queryset().filter(profile__role__base="RESIDENT"))
+        page = self.paginate_queryset(qs)
+        ser = self.get_serializer(page or qs, many=True)
+        return self.get_paginated_response(ser.data) if page is not None else Response(ser.data)
+
+    @action(detail=False, methods=["get"], url_path="staff")
+    def staff(self, request):
+        qs = self.filter_queryset(self.get_queryset().filter(profile__role__base="STAFF").exclude(is_superuser=True))
+        page = self.paginate_queryset(qs)
+        ser = self.get_serializer(page or qs, many=True)
+        return self.get_paginated_response(ser.data) if page is not None else Response(ser.data)
+
+
+# 🔒 Perfil del usuario autenticado
 @api_view(["GET"])
 @authentication_classes([TokenAuthentication])
 @permission_classes([IsAuthenticated])
@@ -96,67 +168,7 @@ def change_password(request):
     ser.save()
     return Response({"detail": "Contraseña actualizada correctamente."}, status=status.HTTP_200_OK)
 
-# ===================== ADMIN USERS =====================
-
-class AdminUserViewSet(viewsets.ModelViewSet):
-    queryset = User.objects.select_related("profile__role").all().order_by("id")
-    serializer_class = AdminUserSerializer
-    authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated, IsAdmin]
-
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ["username", "first_name", "last_name", "email", "profile__role__code", "profile__role__name"]
-    ordering_fields = ["id", "username", "email", "first_name", "last_name", "is_active"]
-    filterset_fields = ["is_active", "is_superuser", "profile__role__code"]
-
-    def get_queryset(self):
-        qs = super().get_queryset()
-        group = self.request.query_params.get("group")
-        if group == "residents":
-            qs = qs.filter(profile__role__base="RESIDENT")
-        elif group == "staff":
-            qs = qs.filter(profile__role__base="STAFF").exclude(is_superuser=True)
-        return qs
-
-    def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
-        if instance.pk == request.user.pk:
-            return Response({"detail": "No puedes eliminar tu propia cuenta."}, status=status.HTTP_400_BAD_REQUEST)
-
-        if getattr(instance, "is_superuser", False) and not getattr(request.user, "is_superuser", False):
-            return Response({"detail": "Solo un superusuario puede eliminar a otro superusuario."}, status=status.HTTP_403_FORBIDDEN)
-
-        if getattr(instance, "is_superuser", False) and not User.objects.filter(
-            is_superuser=True, is_active=True
-        ).exclude(pk=instance.pk).exists():
-            return Response({"detail": "No se puede eliminar el último superusuario activo."}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            self.perform_destroy(instance)
-        except (ProtectedError, RestrictedError):
-            return Response({"detail": "No se puede eliminar: tiene registros relacionados (integridad referencial)."}, status=status.HTTP_409_CONFLICT)
-        except IntegrityError as e:
-            return Response({"detail": "No se puede eliminar por integridad referencial.", "error": str(e)}, status=status.HTTP_409_CONFLICT)
-        except Exception as e:
-            return Response({"detail": "Error inesperado al eliminar.", "error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-    @action(detail=False, methods=["get"], url_path="residents")
-    def residents(self, request):
-        qs = self.filter_queryset(self.get_queryset().filter(profile__role__base="RESIDENT"))
-        page = self.paginate_queryset(qs)
-        ser = self.get_serializer(page or qs, many=True)
-        return self.get_paginated_response(ser.data) if page is not None else Response(ser.data)
-
-    @action(detail=False, methods=["get"], url_path="staff")
-    def staff(self, request):
-        qs = self.filter_queryset(self.get_queryset().filter(profile__role__base="STAFF").exclude(is_superuser=True))
-        page = self.paginate_queryset(qs)
-        ser = self.get_serializer(page or qs, many=True)
-        return self.get_paginated_response(ser.data) if page is not None else Response(ser.data)
-
-# ===================== ROLES / PERMISOS =====================
-
+# 🧩 Roles
 class RolViewSet(viewsets.ModelViewSet):
     queryset = Rol.objects.all().order_by("code")
     serializer_class = RolSimpleSerializer
@@ -166,9 +178,9 @@ class RolViewSet(viewsets.ModelViewSet):
     def destroy(self, request, *args, **kwargs):
         rol = self.get_object()
         if getattr(rol, "is_system", False):
-            return Response({"detail": "No se puede borrar un rol de sistema."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail":"No se puede borrar un rol de sistema."}, status=status.HTTP_400_BAD_REQUEST)
         if Profile.objects.filter(role=rol).exists():
-            return Response({"detail": "No se puede borrar: hay usuarios usando este rol."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail":"No se puede borrar: hay usuarios usando este rol."}, status=status.HTTP_400_BAD_REQUEST)
         return super().destroy(request, *args, **kwargs)
 
     @action(detail=True, methods=["post"], url_path="add-permissions")
@@ -186,7 +198,7 @@ class RolViewSet(viewsets.ModelViewSet):
         perms = Permission.objects.filter(id__in=ids)
         rol.permissions.remove(*perms)
         return Response(self.get_serializer(rol).data)
-
+    
     @action(detail=True, methods=["get"], url_path="permissions")
     def list_permissions(self, request, pk=None):
         rol = self.get_object()
@@ -196,8 +208,10 @@ class RolViewSet(viewsets.ModelViewSet):
         data = PermissionBriefSerializer(perms, many=True).data
         return Response(data)
 
+# 📚 Catálogo de permisos (solo lectura)
 class PermissionViewSet(viewsets.ModelViewSet):
-    queryset = Permission.objects.select_related("content_type").all().order_by("content_type__app_label", "codename")
+    queryset = Permission.objects.select_related("content_type").all() \
+        .order_by("content_type__app_label","codename")
     serializer_class = PermissionBriefSerializer
     http_method_names = ["get"]
     authentication_classes = [TokenAuthentication]
@@ -214,15 +228,17 @@ class PermissionViewSet(viewsets.ModelViewSet):
                 Q(content_type__model__icontains=q)
             )
         return qs
-
-# ===================== UNIDADES / CUOTAS / PAGOS / INFRACCIONES =====================
-
+#-----UNIDAD GESTION
 class UnidadViewSet(viewsets.ModelViewSet):
     queryset = Unidad.objects.select_related("propietario", "residente").all()
     serializer_class = UnidadSerializer
+
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated, IsAdmin]
+
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
+
+    # Lookups útiles (puedes ajustar)
     filterset_fields = {
         "manzana": ["exact", "icontains"],
         "lote": ["exact", "icontains"],
@@ -236,9 +252,12 @@ class UnidadViewSet(viewsets.ModelViewSet):
     ordering_fields = ["manzana", "lote", "numero", "updated_at"]
     ordering = ["manzana", "lote", "numero"]
 
+    # --- Compatibilidad temporal con ?torre=&bloque= ---
     def get_queryset(self):
         qs = super().get_queryset()
         req = self.request.query_params
+
+        # Permite seguir usando ?torre=&bloque= desde el FE antiguo
         torre = req.get("torre")
         bloque = req.get("bloque")
         if torre:
@@ -257,23 +276,32 @@ class UnidadViewSet(viewsets.ModelViewSet):
 
     @action(methods=["post"], detail=True, url_path="asignar")
     def asignar(self, request, pk=None):
+        """
+        Body: { "propietario": user_id | null, "residente": user_id | null }
+        """
         obj = self.get_object()
         ser = self.get_serializer(obj, data=request.data, partial=True)
         ser.is_valid(raise_exception=True)
         obj = ser.save()
         return Response(self.get_serializer(obj).data, status=status.HTTP_200_OK)
 
+#PAGOS Y CUOTAS
 class CuotaViewSet(viewsets.ModelViewSet):
     queryset = Cuota.objects.select_related("unidad").all()
     serializer_class = CuotaSerializer
     authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated]  # + tu IsAdmin si aplica
+
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
-    filterset_fields = ["unidad", "periodo", "concepto", "estado", "is_active", "unidad__manzana", "unidad__lote", "unidad__numero"]
+    filterset_fields = [
+    "unidad", "periodo", "concepto", "estado", "is_active",
+    "unidad__manzana", "unidad__lote", "unidad__numero",
+    ]
     search_fields = ["periodo", "concepto", "unidad__manzana", "unidad__lote", "unidad__numero"]
     ordering_fields = ["vencimiento", "updated_at", "total_a_pagar", "pagado"]
     ordering = ["-periodo", "unidad_id"]
 
+    # ---------- generar ----------
     def get_serializer_class(self):
         if getattr(self, "action", None) == "generar":
             return GenerarCuotasSerializer
@@ -281,15 +309,15 @@ class CuotaViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"], url_path="generar")
     def generar(self, request):
-        s = self.get_serializer(data=request.data)
+        s = self.get_serializer(data=request.data)  # GenerarCuotasSerializer
         s.is_valid(raise_exception=True)
         data = s.validated_data
 
-        periodo = data["periodo"]
-        concepto = data["concepto"]
-        monto_base = data["monto_base"]
-        usa_coeficiente = data["usa_coeficiente"]
-        vencimiento = data["vencimiento"]
+        periodo        = data["periodo"]
+        concepto       = data["concepto"]
+        monto_base     = data["monto_base"]
+        usa_coeficiente= data["usa_coeficiente"]
+        vencimiento    = data["vencimiento"]
 
         afectadas = []
         for u in Unidad.objects.filter(is_active=True):
@@ -302,6 +330,7 @@ class CuotaViewSet(viewsets.ModelViewSet):
                     "vencimiento": vencimiento,
                 }
             )
+            # actualizar si ya existía
             c.monto_base = monto_base
             c.usa_coeficiente = usa_coeficiente
             if usa_coeficiente:
@@ -314,15 +343,17 @@ class CuotaViewSet(viewsets.ModelViewSet):
 
         return Response({"ok": True, "cuotas_afectadas": afectadas, "total": len(afectadas)}, status=status.HTTP_201_CREATED)
 
+    # ---------- pagar desde la cuota ----------
     @action(detail=True, methods=["post"], url_path="pagos")
     def registrar_pago(self, request, pk=None):
         cuota = self.get_object()
-        data = {**request.data, "cuota": cuota.id}
+        data = {**request.data, "cuota": cuota.id}  # forzar la cuota correcta
         ser = PagoCreateSerializer(data=data, context={"request": request})
         ser.is_valid(raise_exception=True)
-        pago = ser.save()
+        pago = ser.save()  # aplica automáticamente
         return Response(PagoSerializer(pago).data, status=status.HTTP_201_CREATED)
 
+    # ---------- anular cuota ----------
     @action(detail=True, methods=["post"], url_path="anular")
     def anular_cuota(self, request, pk=None):
         cuota = self.get_object()
@@ -336,7 +367,7 @@ class CuotaViewSet(viewsets.ModelViewSet):
 class PagoViewSet(viewsets.ModelViewSet):
     queryset = Pago.objects.select_related("cuota", "creado_por").all()
     authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated]  # agrega tu IsAdmin si aplica
     filter_backends = [DjangoFilterBackend, OrderingFilter]
     filterset_fields = ["cuota", "valido", "medio"]
     ordering = ["-created_at"]
@@ -350,12 +381,13 @@ class PagoViewSet(viewsets.ModelViewSet):
         pago = ser_in.save()
         ser_out = PagoSerializer(pago, context={"request": request})
         return Response(ser_out.data, status=status.HTTP_201_CREATED)
-
+    
 class InfraccionViewSet(viewsets.ModelViewSet):
     queryset = Infraccion.objects.select_related("unidad", "residente", "creado_por").all()
     serializer_class = InfraccionSerializer
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
+
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ["unidad", "residente", "estado", "tipo", "is_active", "fecha"]
     search_fields = ["descripcion", "unidad__manzana", "unidad__lote", "unidad__numero"]
@@ -380,9 +412,15 @@ class InfraccionViewSet(viewsets.ModelViewSet):
         obj.save(update_fields=["estado", "is_active", "updated_at"])
         return Response(self.get_serializer(obj).data)
 
-# ===================== TAREAS =====================
-
+# ====== TAREAS ======
 class TareaViewSet(viewsets.ModelViewSet):
+    """
+    CU15 / CU24:
+    - Admin/Staff ven todas y pueden crear/editar.
+    - Residentes solo ven: asignadas a ellos, creadas por ellos,
+      de su rol (si hay asignado_a_rol) o de sus unidades.
+    - Un asignado puede actualizar estado/descripcion y comentar.
+    """
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
@@ -392,6 +430,7 @@ class TareaViewSet(viewsets.ModelViewSet):
     ordering = ["-updated_at", "-created_at"]
 
     def get_serializer_class(self):
+        # En create/update usa write; en list/retrieve devuelve full
         if self.action in {"create", "update", "partial_update"}:
             return TareaWriteSerializer
         return TareaSerializer
@@ -399,12 +438,18 @@ class TareaViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         u = self.request.user
         qs = Tarea.objects.select_related("asignado_a", "asignado_a_rol", "creado_por", "unidad")
+        # Admin/staff ven todo
+        from .permissions import user_role_code
         if getattr(u, "is_superuser", False) or user_role_code(u) in {"ADMIN", "STAFF"}:
             return qs
+        # Residentes: sólo las relacionadas
         mis_unidades = Unidad.objects.filter(Q(propietario=u) | Q(residente=u)).values_list("id", flat=True)
         rol_id = getattr(getattr(getattr(u, "profile", None), "role", None), "id", None)
         return qs.filter(
-            Q(creado_por=u) | Q(asignado_a=u) | Q(unidad_id__in=mis_unidades) | Q(asignado_a_rol_id=rol_id)
+            Q(creado_por=u) |
+            Q(asignado_a=u) |
+            Q(unidad_id__in=mis_unidades) |
+            Q(asignado_a_rol_id=rol_id)
         ).distinct()
 
     def perform_create(self, serializer):
@@ -412,12 +457,16 @@ class TareaViewSet(viewsets.ModelViewSet):
         is_admin = getattr(u, "is_superuser", False) or user_role_code(u) == "ADMIN"
         can_manage = has_role_permission(u, "manage_tasks")
         if not (is_admin or can_manage):
-            raise serializers.ValidationError({"detail": "No autorizado para crear tareas."})
+            return Response({"detail": "No autorizado para crear tareas."}, status=403)
+
         obj = serializer.save(creado_por=u)
         if obj.asignado_a and obj.estado == "NUEVA":
             obj.estado = "ASIGNADA"
             obj.save(update_fields=["estado", "updated_at"])
+            
 
+
+    
     def update(self, request, *args, **kwargs):
         instancia = self.get_object()
         u = request.user
@@ -440,9 +489,13 @@ class TareaViewSet(viewsets.ModelViewSet):
 
         self.perform_update(serializer)
         return Response(TareaSerializer(instancia).data)
-
+    
+    
+    # ---- Acciones de CU24 ----
     @action(detail=True, methods=["post"])
     def asignar(self, request, pk=None):
+        """Asignar a usuario o a rol (exclusivo). Solo admin/staff."""
+        from .permissions import user_role_code
         if not (getattr(request.user, "is_superuser", False) or user_role_code(request.user) in {"ADMIN", "STAFF"}):
             return Response({"detail": "No autorizado."}, status=403)
         obj = self.get_object()
@@ -459,6 +512,7 @@ class TareaViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def tomar(self, request, pk=None):
+        """Un usuario puede 'tomar' una tarea de rol si su rol coincide."""
         obj = self.get_object()
         my_rol_id = getattr(getattr(getattr(request.user, "profile", None), "role", None), "id", None)
         if not my_rol_id or obj.asignado_a_rol_id != my_rol_id:
@@ -472,11 +526,13 @@ class TareaViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def cambiar_estado(self, request, pk=None):
+        """Asignado o staff puede cambiar estado."""
         obj = self.get_object()
         nuevo = request.data.get("estado")
         if nuevo not in dict(Tarea.ESTADO_CHOICES):
             return Response({"detail": "Estado inválido."}, status=400)
         u = request.user
+        from .permissions import user_role_code
         is_staff = getattr(u, "is_superuser", False) or user_role_code(u) in {"ADMIN", "STAFF"}
         if not is_staff and obj.asignado_a_id != u.id:
             return Response({"detail": "No autorizado."}, status=403)
@@ -486,13 +542,13 @@ class TareaViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def comentar(self, request, pk=None):
+        """Crea comentario en la tarea (cualquiera que pueda verla)."""
         obj = self.get_object()
         texto = (request.data.get("cuerpo") or "").strip()
         if not texto:
             return Response({"detail": "cuerpo requerido."}, status=400)
         c = TareaComentario.objects.create(tarea=obj, autor=request.user, cuerpo=texto)
         return Response(TareaComentarioSerializer(c).data, status=201)
-
     def destroy(self, request, *args, **kwargs):
         u = request.user
         is_admin = getattr(u, "is_superuser", False) or user_role_code(u) == "ADMIN"
@@ -501,14 +557,14 @@ class TareaViewSet(viewsets.ModelViewSet):
             return Response({"detail": "No autorizado para eliminar tareas."}, status=403)
         return super().destroy(request, *args, **kwargs)
 
-# ===================== ESTADO DE CUENTA =====================
-
 class EstadoCuentaView(APIView):
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
 
     def get_user_unidades(self, user):
-        return Unidad.objects.filter(Q(propietario=user) | Q(residente=user)).order_by("manzana", "lote", "numero")
+        # Unidades donde es propietario o residente
+       return Unidad.objects.filter(Q(propietario=user) | Q(residente=user)).order_by("manzana", "lote", "numero")
+
 
     def get(self, request):
         user = request.user
@@ -516,6 +572,7 @@ class EstadoCuentaView(APIView):
         if not unidades.exists():
             return Response({"detail": "No tiene unidades asociadas."}, status=404)
 
+        # unidad elegida (si no, la primera)
         unidad_id = request.query_params.get("unidad")
         if unidad_id:
             unidad = unidades.filter(id=unidad_id).first()
@@ -524,9 +581,13 @@ class EstadoCuentaView(APIView):
         else:
             unidad = unidades.first()
 
+        # Cuotas de esa unidad (puedes ajustar límites si quieres)
         cuotas_qs = Cuota.objects.select_related("unidad").filter(unidad=unidad).order_by("-vencimiento", "-updated_at")
+
+        # Pagos de esa unidad
         pagos_qs = Pago.objects.select_related("cuota", "creado_por", "cuota__unidad").filter(cuota__unidad=unidad).order_by("-created_at")
 
+        # Resumen
         saldo_expr = ExpressionWrapper(F("total_a_pagar") - F("pagado"), output_field=DecimalField(max_digits=12, decimal_places=2))
         agg = cuotas_qs.aggregate(
             saldo_pendiente=Sum(saldo_expr),
@@ -552,6 +613,7 @@ class EstadoCuentaView(APIView):
         }
         return Response(data, status=200)
 
+
 class EstadoCuentaExportCSV(APIView):
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
@@ -576,6 +638,7 @@ class EstadoCuentaExportCSV(APIView):
         cuotas_qs = Cuota.objects.select_related("unidad").filter(unidad=unidad).order_by("-vencimiento", "-updated_at")
         pagos_qs = Pago.objects.select_related("cuota", "cuota__unidad").filter(cuota__unidad=unidad).order_by("-created_at")
 
+        # Generar CSV
         resp = HttpResponse(content_type="text/csv")
         filename = f"estado_cuenta_unidad_{unidad.id}_{date.today().isoformat()}.csv"
         resp["Content-Disposition"] = f'attachment; filename="{filename}"'
@@ -599,13 +662,12 @@ class EstadoCuentaExportCSV(APIView):
 
         return resp
 
-# ===================== AVISOS =====================
-
 class AvisoViewSet(viewsets.ModelViewSet):
     queryset = Aviso.objects.all()
     serializer_class = AvisoSerializer
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
+
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
     filterset_fields = ["audiencia", "status", "torre", "is_active"]
     search_fields = ["titulo", "cuerpo", "torre"]
@@ -669,23 +731,47 @@ class AvisoViewSet(viewsets.ModelViewSet):
         aviso.status = "ARCHIVADO"
         aviso.save(update_fields=["status", "updated_at"])
         return Response(self.get_serializer(aviso).data)
+    
+# ========= CU16: VIEWSET DE ÁREAS COMUNES =========
+from datetime import datetime, timedelta, time
+from django.utils import timezone
+from django.db.models import Q
+from rest_framework import viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
 
-# ===================== AREAS COMUNES =====================
+from .models import AreaComun, AreaDisponibilidad, ReservaArea
+from .serializers import AreaComunSerializer, DisponibilidadResponseSerializer
+# ya tienes:
+# from rest_framework.authentication import TokenAuthentication
+# from rest_framework.permissions import IsAuthenticated
+# from .permissions import IsAdmin
 
 class AreaComunViewSet(viewsets.ModelViewSet):
+    """
+    CRUD de áreas comunes (solo admins deberían crearlas/editar).
+    Acción GET disponibilidad: devuelve slots libres para una fecha.
+    """
     queryset = AreaComun.objects.filter(activa=True)
     serializer_class = AreaComunSerializer
     authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated]   # lectura; escritura restringida abajo
 
     def get_permissions(self):
+        # list/retrieve/disponibilidad → autenticado
         if self.action in {"list", "retrieve", "disponibilidad"}:
             return [IsAuthenticated()]
+        # create/update/destroy → admin
         return [IsAuthenticated(), IsAdmin()]
 
     @action(detail=True, methods=["get"], url_path="disponibilidad")
     def disponibilidad(self, request, pk=None):
+        """
+        GET /api/areas-comunes/{id}/disponibilidad/?date=YYYY-MM-DD&slot=60
+        Opcional: &from=HH:MM&to=HH:MM (sobrescribe ventanas configuradas)
+        """
         area = self.get_object()
+
         date_str = request.query_params.get("date")
         if not date_str:
             return Response({"detail": "Parámetro 'date' (YYYY-MM-DD) es requerido."}, status=400)
@@ -703,8 +789,9 @@ class AreaComunViewSet(viewsets.ModelViewSet):
         override_end = request.query_params.get("to")
 
         tz = timezone.get_current_timezone()
-        weekday = target_date.weekday()
+        weekday = target_date.weekday()  # 0..6
 
+        # Ventanas: override o reglas de la BD
         if override_start and override_end:
             try:
                 s_h, s_m = map(int, override_start.split(":"))
@@ -715,9 +802,16 @@ class AreaComunViewSet(viewsets.ModelViewSet):
         else:
             reglas = list(AreaDisponibilidad.objects.filter(area=area, dia_semana=weekday).order_by("hora_inicio"))
             if not reglas:
-                return Response({"area_id": area.id, "date": target_date, "slot_minutes": slot_minutes, "windows": [], "slots": []})
+                return Response({
+                    "area_id": area.id,
+                    "date": target_date,
+                    "slot_minutes": slot_minutes,
+                    "windows": [],
+                    "slots": []
+                })
             windows = [(r.hora_inicio, r.hora_fin) for r in reglas]
 
+        # Reservas activas que solapan ese día
         day_start = timezone.make_aware(datetime.combine(target_date, time(0, 0, 0)), tz)
         day_end   = timezone.make_aware(datetime.combine(target_date, time(23, 59, 59)), tz)
         activas = ["PENDIENTE", "CONFIRMADA", "PAGADA"]
@@ -727,6 +821,7 @@ class AreaComunViewSet(viewsets.ModelViewSet):
             .order_by("fecha_inicio")
         )
 
+        # Unir reservas solapadas
         busy = sorted([(r.fecha_inicio, r.fecha_fin) for r in reservas], key=lambda x: x[0])
         merged = []
         for b in busy:
@@ -739,6 +834,7 @@ class AreaComunViewSet(viewsets.ModelViewSet):
         def to_dt(d, t):
             return timezone.make_aware(datetime.combine(d, t), tz)
 
+        # Calcular intervalos libres por ventana
         free_intervals = []
         for w_start, w_end in windows:
             w_s = to_dt(target_date, w_start)
@@ -755,6 +851,7 @@ class AreaComunViewSet(viewsets.ModelViewSet):
             if cur < w_e:
                 free_intervals.append((cur, w_e))
 
+        # Discretizar a slots de N minutos
         slots = []
         step = timedelta(minutes=slot_minutes)
         for s, e in free_intervals:
@@ -770,23 +867,29 @@ class AreaComunViewSet(viewsets.ModelViewSet):
             "windows": [{"start": w[0], "end": w[1]} for w in windows],
             "slots": slots
         }
-        # Suponiendo que tu serializer acepta dict plano:
-        return Response(data)
-
-# ===================== STAFF =====================
-
+        resp = DisponibilidadResponseSerializer(data)
+        return Response(resp.data)
 class StaffViewSet(viewsets.ModelViewSet):
+    """
+    CRUD de PERSONAL (sub-roles con Rol.base='STAFF').
+    """
     serializer_class = AdminUserSerializer
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated, IsAdmin]
     queryset = User.objects.select_related("profile", "profile__role").all().order_by("id")
 
+    # Habilita búsqueda (?search=) y orden (?ordering=)
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["username", "first_name", "last_name", "email", "profile__role__code", "profile__role__name"]
     ordering_fields = ["id", "username", "first_name", "last_name", "email"]
 
     def get_queryset(self):
-        qs = super().get_queryset().filter(profile__role__base="STAFF").exclude(is_superuser=True)
+        # Solo personal (base STAFF), excluye superusuarios
+        qs = super().get_queryset().filter(
+            profile__role__base="STAFF"
+        ).exclude(is_superuser=True)
+
+        # Alias para ?q= como búsqueda rápida (además de ?search= propio de DRF)
         q = (self.request.query_params.get("q") or "").strip()
         if q:
             qs = qs.filter(
@@ -833,9 +936,8 @@ class StaffViewSet(viewsets.ModelViewSet):
     def partial_update(self, request, *args, **kwargs):
         kwargs["partial"] = True
         return self.update(request, *args, **kwargs)
-
-# ===================== VISITANTES / VISITS =====================
-
+    
+# ========== VISITANTES ==========
 class VisitorViewSet(viewsets.ModelViewSet):
     queryset = Visitor.objects.all().order_by("full_name")
     serializer_class = VisitorSerializer
@@ -848,42 +950,139 @@ class VisitorViewSet(viewsets.ModelViewSet):
             return [IsAuthenticated()]
         return [IsAuthenticated(), IsStaff()]
 
+
+# ========== VISITAS ==========
 class VisitViewSet(viewsets.ModelViewSet):
     queryset = Visit.objects.select_related("visitor", "unit", "host_resident").all()
-    serializer_class = VisitSerializer
     filter_backends = [DjangoFilterBackend, SearchFilter, OrderingFilter]
-    filterset_fields = ["status", "unit", "host_resident"]
+    filterset_fields = ["status", "unit", "host_resident", "approval_status"]
     search_fields = ["visitor__full_name", "visitor__doc_number", "vehicle_plate", "purpose"]
     ordering_fields = ["created_at", "entry_at", "exit_at"]
 
+    # ---- serializers según acción ----
+    def get_serializer_class(self):
+        if self.action in ("create", "update", "partial_update"):
+            return VisitWriteSerializer
+        return VisitSerializer
+
+    # ---- permisos por acción ----
     def get_permissions(self):
-        staff_actions = {"create", "update", "partial_update", "destroy", "enter", "exit", "cancel", "deny"}
+        # acciones de portería (STAFF/ADMIN)
+        staff_actions = {"create", "update", "partial_update", "destroy", "enter", "exit", "cancel"}
         if self.action in staff_actions:
             return [IsAuthenticated(), IsStaff()]
+        # aprobación del residente (el anfitrión decide)
+        if self.action in {"approve", "deny_approval", "approve_by_token"}:
+            # approve_by_token valida en el método; aquí sólo autenticación
+            return [IsAuthenticated()]
+        # listar/ver → autenticado
         return [IsAuthenticated()]
 
+    # ---- visibilidad según usuario ----
     def get_queryset(self):
         qs = super().get_queryset()
         u = self.request.user
-        code = user_role_code(u)
+
+        # filtro rápido "mine=1": como residente, mis visitas a mis unidades
+        if self.request.query_params.get("mine") == "1":
+            return qs.filter(host_resident=u)
+
+        # STAFF/ADMIN ven todo
         base = getattr(getattr(getattr(u, "profile", None), "role", None), "base", None)
-        if getattr(u, "is_superuser", False) or code == "ADMIN" or base == "STAFF":
+        if getattr(u, "is_superuser", False) or base in {"STAFF", "ADMIN"}:
             return qs
+
+        # Residente: solo sus visitas o visitas a sus unidades
         mis_unidades = Unidad.objects.filter(Q(propietario=u) | Q(residente=u)).values_list("id", flat=True)
         return qs.filter(Q(host_resident=u) | Q(unit_id__in=mis_unidades)).distinct()
 
+    # ---- create/update delegan en serializer (que setea created_by/updated_by) ----
     def perform_create(self, serializer):
         serializer.save()
 
     def perform_update(self, serializer):
         serializer.save()
 
+    # ======== ACCIONES DE APROBACIÓN (RESIDENTE) ========
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        """
+        Residente anfitrión aprueba. Body opcional: {"hours_valid": 24}
+        """
+        visit = self.get_object()
+        # permiso: debe ser el anfitrión
+        if visit.host_resident_id != request.user.id:
+            return Response({"detail": "No eres el anfitrión de esta visita."}, status=403)
+
+        ser = VisitApproveSerializer(data=request.data or {})
+        ser.is_valid(raise_exception=True)
+        hours = ser.validated_data.get("hours_valid", 24)
+        visit.approve(request.user, hours_valid=hours)
+        visit.updated_by = request.user
+        visit.save()
+        return Response(VisitSerializer(visit, context={"request": request}).data)
+
+    @action(detail=True, methods=["post"], url_path="deny-approval")
+    def deny_approval(self, request, pk=None):
+        """
+        Residente anfitrión deniega aprobación (NO cambia 'status'; sólo aprobación).
+        """
+        visit = self.get_object()
+        if visit.host_resident_id != request.user.id:
+            return Response({"detail": "No eres el anfitrión de esta visita."}, status=403)
+
+        ser = VisitDenySerializer(data=request.data or {})
+        ser.is_valid(raise_exception=True)
+        visit.deny(request.user)
+        visit.updated_by = request.user
+        visit.save()
+        return Response(VisitSerializer(visit, context={"request": request}).data)
+
+    @action(detail=False, methods=["post"], url_path="approve-by-token")
+    def approve_by_token(self, request):
+        """
+        Alternativa si envías link con token: requiere que el usuario autenticado
+        sea el anfitrión de la visita encontrada por token.
+        Body: {"token": "<uuid>", "hours_valid": 24}
+        """
+        token = (request.data or {}).get("token")
+        if not token:
+            return Response({"detail": "Falta token."}, status=400)
+        try:
+            visit = Visit.objects.get(approval_token=token)
+        except Visit.DoesNotExist:
+            return Response({"detail": "Token inválido."}, status=404)
+        if visit.host_resident_id != request.user.id:
+            return Response({"detail": "No eres el anfitrión."}, status=403)
+
+        hours = int((request.data or {}).get("hours_valid") or 24)
+        visit.approve(request.user, hours_valid=hours)
+        visit.updated_by = request.user
+        visit.save()
+        return Response(VisitSerializer(visit, context={"request": request}).data)
+
+    # ======== ACCIONES DE PORTERÍA (STAFF/ADMIN) ========
+
     @action(detail=True, methods=["post"])
     def enter(self, request, pk=None):
+        """
+        Check-in en portería. Requiere aprobación válida, a menos que 'force=true'.
+        """
         visit = self.get_object()
         if visit.status not in ["REGISTRADO", "DENEGADO"]:
             return Response({"detail": "La visita no está en estado apto para ingreso."}, status=400)
-        visit.mark_entry(request.user)
+
+        ser = VisitCheckInSerializer(data=request.data or {})
+        ser.is_valid(raise_exception=True)
+        force = ser.validated_data.get("force", False)
+
+        try:
+            visit.mark_entry(request.user, force=force)
+        except Exception as e:
+            return Response({"detail": str(e)}, status=400)
+
+        visit.updated_by = request.user
         visit.save()
         return Response(VisitSerializer(visit, context={"request": request}).data)
 
@@ -893,6 +1092,7 @@ class VisitViewSet(viewsets.ModelViewSet):
         if visit.status != "INGRESADO":
             return Response({"detail": "La visita no está ingresada."}, status=400)
         visit.mark_exit(request.user)
+        visit.updated_by = request.user
         visit.save()
         return Response(VisitSerializer(visit, context={"request": request}).data)
 
@@ -906,6 +1106,7 @@ class VisitViewSet(viewsets.ModelViewSet):
         visit.save()
         return Response(VisitSerializer(visit, context={"request": request}).data)
 
+    # (Mantengo tu 'deny' original por si lo usas en portería para rechazar el movimiento)
     @action(detail=True, methods=["post"])
     def deny(self, request, pk=None):
         visit = self.get_object()
@@ -916,106 +1117,6 @@ class VisitViewSet(viewsets.ModelViewSet):
         visit.save()
         return Response(VisitSerializer(visit, context={"request": request}).data)
 
-# ===================== VEHÍCULOS / SOLICITUDES =====================
-
-class VehiculoViewSet(viewsets.ModelViewSet):
-    queryset = Vehiculo.objects.select_related("propietario", "unidad").all()
-    serializer_class = VehiculoSerializer
-    authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated, IsOwnerOrAdmin]
-    filter_backends = [DjangoFilterBackend]
-    filterset_fields = ["placa", "propietario", "unidad", "activo", "tipo"]
-
-    def get_queryset(self):
-        qs = super().get_queryset()
-        if not IsAdminOrStaff().has_permission(self.request, self):
-            qs = qs.filter(propietario=self.request.user)
-        return qs
-
-    def perform_update(self, serializer):
-        if not IsAdminOrStaff().has_permission(self.request, self):
-            for k in ("propietario", "placa", "unidad", "autorizado_en", "autorizado_por", "activo"):
-                serializer.validated_data.pop(k, None)
-        serializer.save()
-
-class SolicitudVehiculoViewSet(mixins.CreateModelMixin,
-                               mixins.ListModelMixin,
-                               mixins.RetrieveModelMixin,
-                               viewsets.GenericViewSet):
-    queryset = SolicitudVehiculo.objects.select_related(
-        "solicitante", "unidad", "vehiculo", "revisado_por"
-    ).all()
-    authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated]
-    filter_backends = [DjangoFilterBackend]
-    filterset_fields = ["estado", "placa", "unidad", "solicitante"]
-
-    def get_serializer_class(self):
-        if self.action == "create":
-            return SolicitudVehiculoCreateSerializer
-        if self.action == "revisar":
-            return SolicitudVehiculoReviewSerializer
-        return SolicitudVehiculoListSerializer
-
-    def get_queryset(self):
-        qs = super().get_queryset()
-        if not IsAdminOrStaff().has_permission(self.request, self):
-            qs = qs.filter(solicitante=self.request.user)
-        return qs
-
-    def perform_create(self, serializer):
-        profile = getattr(self.request.user, "profile", None)
-        unidad = getattr(profile, "unit", None) or getattr(profile, "unidad", None)
-        serializer.save(
-            solicitante=self.request.user,
-            unidad=unidad,
-            estado="PENDIENTE"
-        )
-
-    @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated, IsAdminOrStaff])
-    @transaction.atomic
-    def revisar(self, request, pk=None):
-        obj = self.get_object()
-        if obj.estado != "PENDIENTE":
-            return Response({"detail": "La solicitud ya fue revisada."}, status=400)
-
-        ser = SolicitudVehiculoReviewSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        accion = ser.validated_data["accion"]
-        obs = ser.validated_data.get("observaciones", "")
-
-        if accion == "rechazar":
-            obj.rechazar(rechazado_por=request.user, observ=obs)
-            return Response(SolicitudVehiculoListSerializer(obj).data)
-
-        unidad_override = request.query_params.get("unidad")
-        unidad = obj.unidad
-        if unidad_override:
-            try:
-                unidad = Unidad.objects.get(pk=unidad_override)
-            except Unidad.DoesNotExist:
-                return Response({"detail": "Unidad no existe."}, status=400)
-
-        try:
-            obj.aprobar(aprobado_por=request.user, unidad=unidad, observ=obs)
-        except ValueError as e:
-            return Response({"detail": str(e)}, status=400)
-
-        return Response(SolicitudVehiculoListSerializer(obj).data, status=200)
-
-    @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated])
-    @transaction.atomic
-    def cancelar(self, request, pk=None):
-        obj = self.get_object()
-        if obj.solicitante_id != request.user.id:
-            return Response({"detail": "Solo el solicitante puede cancelar su solicitud."}, status=status.HTTP_403_FORBIDDEN)
-        if obj.estado != "PENDIENTE":
-            return Response({"detail": "Solo se pueden cancelar solicitudes en estado PENDIENTE."}, status=status.HTTP_400_BAD_REQUEST)
-        obs = request.data.get("observaciones", "") or ""
-        obj.cancelar(cancelado_por=request.user, observ=obs)
-        return Response(SolicitudVehiculoListSerializer(obj).data, status=status.HTTP_200_OK)
-
-# ===================== MOCK PAGOS (QR / COMPROBANTE) =====================
 
 def _unidad_display(u):
     b = f"-{u.lote}" if u.lote else ""
@@ -1035,12 +1136,12 @@ class MockCheckoutView(APIView):
         cuota = get_object_or_404(Cuota, pk=request.data.get("cuota"), is_active=True)
 
         # seguridad: la cuota debe ser del usuario (propietario o residente)
-        if not Unidad.objects.filter(id=cuota.unidad_id).filter(Q(propietario=user) | Q(residente=user)).exists():
-            return Response({"detail": "No autorizado sobre esta cuota."}, status=403)
+        if not Unidad.objects.filter(id=cuota.unidad_id).filter(Q(propietario=user)|Q(residente=user)).exists():
+            return Response({"detail":"No autorizado sobre esta cuota."}, status=403)
 
         # sin saldo → nada que pagar
         if cuota.estado == "PAGADA" or cuota.saldo <= 0:
-            return Response({"detail": "No hay saldo pendiente."}, status=400)
+            return Response({"detail":"No hay saldo pendiente."}, status=400)
 
         medio = (request.data.get("medio") or "QR").upper()
         intent = OnlinePaymentIntent.objects.create(
@@ -1052,18 +1153,19 @@ class MockCheckoutView(APIView):
             creado_por=user,
             metadata={"unidad_display": _unidad_display(cuota.unidad), "medio": medio},
         )
-
         token = uuid.uuid4().hex
-        # SITE_URL con fallback a la URL de la request si no está configurada
-        base_url = getattr(settings, "SITE_URL", None) or request.build_absolute_uri("/").rstrip("/")
-        pay_url = f"{base_url}/mock-pay?intent={intent.id}&token={token}"
 
+        # Usa SITE_URL si existe; si no, arma la base con la propia request
+        base_url = getattr(settings, "SITE_URL", None) or request.build_absolute_uri("/").rstrip("/")
+
+        pay_url = f"{base_url}/mock-pay?intent={intent.id}&token={token}"
         intent.provider_id = token
         intent.confirmation_url = pay_url
         intent.qr_payload = pay_url if medio == "QR" else ""
         intent.save()
 
         return Response(OnlinePaymentIntentSerializer(intent).data, status=201)
+
 
 class MockUploadReceiptView(APIView):
     """
@@ -1076,16 +1178,18 @@ class MockUploadReceiptView(APIView):
     def post(self, request):
         intent = get_object_or_404(
             OnlinePaymentIntent, pk=request.data.get("intent"),
-            status__in=["CREATED", "PENDING"]
+            status__in=["CREATED","PENDING"]
         )
 
+        # dueño del intent o admin
         if not (request.user.is_superuser or intent.creado_por_id == request.user.id):
-            return Response({"detail": "No autorizado."}, status=403)
+            return Response({"detail":"No autorizado."}, status=403)
 
         ser = MockReceiptSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         rec = ser.save(uploaded_by=request.user)
         return Response(MockReceiptSerializer(rec).data, status=201)
+
 
 class MockVerifyReceiptView(APIView):
     """
@@ -1097,9 +1201,9 @@ class MockVerifyReceiptView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        is_admin_or_staff = (getattr(request.user, "is_superuser", False) or user_role_code(request.user) in {"ADMIN", "STAFF"})
+        is_admin_or_staff = (getattr(request.user,"is_superuser",False) or user_role_code(request.user) in {"ADMIN","STAFF"})
         if not is_admin_or_staff:
-            return Response({"detail": "No autorizado."}, status=403)
+            return Response({"detail":"No autorizado."}, status=403)
 
         approve = bool(request.data.get("approve"))
         rec = get_object_or_404(MockReceipt, pk=request.data.get("receipt_id"))
@@ -1109,17 +1213,19 @@ class MockVerifyReceiptView(APIView):
             if intent.status != "PAID":
                 intent.status = "FAILED"
                 intent.save(update_fields=["status"])
-            return Response({"detail": "Comprobante rechazado."})
+            return Response({"detail":"Comprobante rechazado."})
 
+        # Idempotencia
         if intent.status == "PAID":
-            return Response({"detail": "Ya estaba aprobado."}, status=200)
+            return Response({"detail":"Ya estaba aprobado."}, status=200)
 
+        # Crea Pago con tu flujo estándar
         monto = rec.amount or intent.amount
         ser = PagoCreateSerializer(
             data={
                 "cuota": intent.cuota_id,
                 "monto": monto,
-                "medio": "TRANSFERENCIA",
+                "medio": "TRANSFERENCIA",  # o "OTRO"
                 "referencia": rec.reference or f"MOCK-{intent.provider_id}",
             },
             context={"request": request}
@@ -1129,6 +1235,26 @@ class MockVerifyReceiptView(APIView):
 
         intent.status = "PAID"
         intent.paid_at = timezone.now()
-        intent.save(update_fields=["status", "paid_at"])
+        intent.save(update_fields=["status","paid_at"])
 
-        return Response({"detail": "Aprobado", "pago": PagoSerializer(pago).data}, status=200)
+        return Response({"detail":"Aprobado", "pago": PagoSerializer(pago).data}, status=200)
+    
+class VehiculoViewSet(viewsets.ModelViewSet):
+    queryset = Vehiculo.objects.all().order_by("-id")
+    serializer_class = VehiculoSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+class SolicitudVehiculoViewSet(viewsets.ModelViewSet):
+    queryset = SolicitudVehiculo.objects.all().order_by("-id")
+    serializer_class = VehiculoSerializer
+    permission_classes = [permissions.IsAuthenticated]
+class SnapshotCheckView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response({"ok": True, "detail": "snapshot-check placeholder"})
+class SnapshotPingView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response({"ok": True, "detail": "snapshot-check placeholder"})

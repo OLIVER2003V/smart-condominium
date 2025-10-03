@@ -258,7 +258,7 @@ export default function Me() {
 
         <div className="au-actions" style={{ marginTop: 12 }}>
           <button className="au-button" type="submit" disabled={loading}>
-            {editing ? (loading ? "Guardando..." : "Guardar") : "Actualizar"}
+            {editing ? (loading ? "Guardando..." : "Guardar") : "Editar"}
           </button>
 
           {editing && (
